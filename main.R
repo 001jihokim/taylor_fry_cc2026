@@ -2,7 +2,6 @@
 # UNSW x TAYLOR FRY T3 2026 Case Competition
 # Team Name - Omega Consulting
 # Members - Jiho Kim, Becky Thai, Christina Lou, Timothy Bae
-
 # =============================================================================
 # 2026 ASOC x Taylor Fry Case Competition
 # Part A: data cleaning   |   Part B: Task 1 (forecast + drivers of incidents)
@@ -16,6 +15,7 @@ library(tidyverse)
 library(lubridate)
 library(broom)
 library(scales)
+library(gbm)         # gradient boosting (B9)
 
 set.seed(2026)
 data_dir <- "."      # <- folder containing the three csv files
@@ -429,6 +429,107 @@ print(scen_out)
 write_csv(scen_out, file.path(out_dir, "scenarios.csv"))
 
 # =============================================================================
+# B9. GRADIENT BOOSTING (GBM) - non-linear benchmark and ensemble
+# Poisson-loss GBM with log(visitors) offset (same exposure logic as the GLM).
+# Uses: (i) check the GLM isn't missing non-linearities/interactions,
+#       (ii) alternative forecast + simple GLM/GBM average, (iii) importance & PDPs.
+# NB: predict.gbm() ignores the offset, so log(visitors) is added back manually.
+# =============================================================================
+gbm_vars <- c("trend", "air_temp_hi", "swell_avg_m", "swell_max_m", "wind_days", "water_temp",
+              "rain_100", "turb_10", "tourist_ratio", "surfer_prop", "marine_health", "n_rips",
+              "len_log", "rocky", "fishing", "rockpool", "n_bins", "patrolled", "lg_log",
+              "drone_10", "campaign_idx", "fa_10", "pa_system", "flags", "equip_10")
+# Severe is sparse -> smaller, more regularised model
+gbm_vars_severe <- setdiff(gbm_vars, c("fishing", "rockpool", "n_bins", "wind_days", "rain_100",
+                                       "turb_10", "air_temp_hi", "swell_avg_m"))
+
+gbm_params <- list(
+  events = list(vars = gbm_vars, depth = 3, minobs = 20, shrink = 0.05, ntrees = 1500),
+  mild   = list(vars = gbm_vars, depth = 3, minobs = 20, shrink = 0.05, ntrees = 1500),
+  close  = list(vars = gbm_vars, depth = 3, minobs = 20, shrink = 0.03, ntrees = 1500),
+  severe = list(vars = gbm_vars_severe, depth = 2, minobs = 30, shrink = 0.01, ntrees = 1500))
+
+fit_gbm <- function(y, data, prm) {
+  f <- as.formula(paste(y, "~", paste(prm$vars, collapse = " + "), "+ offset(log(visitors))"))
+  m <- gbm(f, data = as.data.frame(data), distribution = "poisson",
+           n.trees = prm$ntrees, interaction.depth = prm$depth, shrinkage = prm$shrink,
+           n.minobsinnode = prm$minobs, bag.fraction = 0.7, cv.folds = 5,
+           keep.data = FALSE, verbose = FALSE, n.cores = 1)
+  m$best <- gbm.perf(m, method = "cv", plot.it = FALSE)   # CV-chosen number of trees
+  m
+}
+pred_gbm <- function(m, nd) {
+  exp(predict(m, as.data.frame(nd), n.trees = m$best, type = "link") + log(nd$visitors))
+}
+
+# ---- B9.1 Forward validation (same folds as the GLM) -------------------------
+validate_gbm <- function(y, prm, folds = 2022:2026) {
+  map_dfr(folds, function(k) {
+    tr <- panel %>% filter(fy < k); te <- panel %>% filter(fy == k)
+    m  <- fit_gbm(y, tr, prm); mu <- pred_gbm(m, te)
+    tibble(outcome = y, test_fy = k, pred_gbm = sum(mu),
+           mae_bm_gbm = mean(abs(te[[y]] - mu)), dev_gbm = pois_dev(te[[y]], pmax(mu, 1e-6)))
+  })
+}
+y_map <- unlist(outcomes)                                     # name -> column
+val_gbm <- imap_dfr(gbm_params, ~ validate_gbm(y_map[[.y]], .x) %>% mutate(outcome = .y))
+
+# Side-by-side with the GLM from B5 (lower deviance / MAE = better)
+val_cmp <- val %>%
+  mutate(outcome = names(outcomes)[match(outcome, unlist(outcomes))]) %>%
+  left_join(val_gbm, by = c("outcome", "test_fy")) %>%
+  mutate(pct_err_gbm = pred_gbm / actual - 1) %>%
+  dplyr::select(outcome, test_fy, actual, predicted_glm = predicted, pred_gbm,
+                pct_err_glm = pct_err, pct_err_gbm,
+                mae_glm = mae_bm, mae_gbm = mae_bm_gbm, dev_glm = dev_model, dev_gbm, dev_naive)
+print(val_cmp, n = 40)
+val_cmp %>% group_by(outcome) %>%
+  summarise(across(c(mae_glm, mae_gbm, dev_glm, dev_gbm, dev_naive), mean))
+write_csv(val_cmp, file.path(out_dir, "validation_glm_vs_gbm.csv"))
+
+# ---- B9.2 Final GBMs on all data, importance and partial dependence ----------
+gbm_models <- imap(gbm_params, ~ fit_gbm(y_map[[.y]], panel, .x))
+
+imp <- imap_dfr(gbm_models, ~ summary(.x, n.trees = .x$best, plotit = FALSE) %>%
+                  as_tibble() %>% mutate(model = .y))
+write_csv(imp, file.path(out_dir, "gbm_importance.csv"))
+p_imp <- imp %>% filter(model %in% c("events", "severe")) %>%
+  group_by(model) %>% slice_max(rel.inf, n = 12) %>% ungroup() %>%
+  ggplot(aes(rel.inf, reorder(var, rel.inf))) + geom_col() + facet_wrap(~model, scales = "free") +
+  labs(title = "GBM relative influence", x = "Relative influence (%)", y = NULL) + theme_minimal()
+ggsave(file.path(out_dir, "gbm_importance.png"), p_imp, width = 10, height = 5)
+
+# Partial dependence for the safety levers (shape of the effect, not just a slope)
+pdp <- function(m, var) {
+  g <- plot(m, i.var = var, n.trees = m$best, return.grid = TRUE, continuous.resolution = 40)
+  tibble(var = var, x = as.numeric(g[[1]]), y = g$y)
+}
+safety_vars <- c("lg_log", "drone_10", "campaign_idx", "fa_10", "equip_10")
+pd <- map_dfr(safety_vars, ~ pdp(gbm_models$events, .x) %>% mutate(model = "events")) %>%
+  bind_rows(map_dfr(intersect(safety_vars, gbm_vars_severe),
+                    ~ pdp(gbm_models$severe, .x) %>% mutate(model = "severe")))
+p_pd <- ggplot(pd, aes(x, y)) + geom_line() + facet_grid(model ~ var, scales = "free") +
+  labs(title = "GBM partial dependence - safety levers (log-rate scale)", x = NULL, y = NULL) +
+  theme_minimal()
+ggsave(file.path(out_dir, "gbm_pdp_safety.png"), p_pd, width = 12, height = 5)
+
+# ---- B9.3 FY2027 forecast: GLM vs GBM vs 50/50 ensemble ----------------------
+fc_cmp <- imap_dfr(gbm_models, function(m, nm) {
+  glm_pt <- sum(fc[[nm]]$point); gbm_pt <- sum(pred_gbm(m, future))
+  tibble(outcome = nm, glm = glm_pt, gbm = gbm_pt, ensemble = (glm_pt + gbm_pt) / 2)
+})
+print(fc_cmp)
+write_csv(fc_cmp, file.path(out_dir, "forecast_FY2027_glm_gbm.csv"))
+
+# Beach-level agreement between the two approaches (severe)
+agree <- future %>% mutate(glm = fc$severe$point, gbm = pred_gbm(gbm_models$severe, future)) %>%
+  group_by(beach_nm) %>% summarise(glm = sum(glm), gbm = sum(gbm), .groups = "drop")
+cor(agree$glm, agree$gbm, method = "spearman")             # rank agreement across beaches
+# Interpretation guide: if GBM validates materially better, report the ensemble point
+# forecast and keep the GLM prediction intervals; if similar, stay with the GLM for
+# simplicity and explainability. Prediction intervals still come from the GLM simulation.
+
+# =============================================================================
 # KEY ASSUMPTIONS / LIMITATIONS TO STATE ON THE SLIDES
 # - FY2027 covariates: climatology (last 3 FY), visitors grown at recent trend,
 #   safety resourcing held at FY2026 (no new funding).
@@ -438,6 +539,10 @@ write_csv(scen_out, file.path(out_dir, "scenarios.csv"))
 #   (mild optimism). Severe counts are sparse (220 deaths) -> wide intervals.
 # - response_min includes reporting delay; n_lifeguards / drone_present are measured
 #   at incident time (post-treatment) so they are used only in the severity model.
+# - GBM tuning is light (fixed depth/shrinkage, CV tree count with random folds, which
+#   ignores beach/time structure so the CV-chosen tree count is a little optimistic).
 # - Spurious proxies (icecream_visits, n_bins) can survive selection - sanity-check
 #   signs/sizes before interpreting them.
 # =============================================================================
+
+
