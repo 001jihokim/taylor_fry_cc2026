@@ -1,0 +1,14 @@
+item,unit,cost_fd,cost_type,linked_var,effect_per_unit,notes
+Drone hardware,per drone,9000,one_off,drone_hrs,Supports up to 120 flight hours per month,Assume a 3-year asset life
+Drone operator training,per operator,450,one_off,drone_hrs,Required before an operator can fly,One-off per operator
+Drone operator (casual),per flight hour,45,hourly,drone_hrs,+1 drone_hrs,Hardware and a trained operator must already be in place
+Casual SLSC lifeguard,per hour,58,hourly,lg_hrs,+1 lg_hrs,Can be targeted to any beach and any month
+Full-time SLSC lifeguard,per FTE per year,80000,annual,lg_hrs,+1750 lg_hrs per year at one beach,Spread evenly over 12 months
+Full-time recruitment,per FTE,500,one_off,lg_hrs,Nil direct effect,One-off cost incurred alongside each new FTE
+Beach safety education campaign,per postcode per summer,15000,annual,campaign_idx,"Sets campaign_idx to at least 0.7 for Nov-Feb. In other words, it  takes the MAX(campaign_idx, 0.7).",Applies to every beach in the postcode
+Community first aid & rescue training,per postcode per year,20000,annual,first_aid_cap,+10 first_aid_cap capped at 100,Takes effect from the following month
+PA system,per beach,25000,one_off + annual,pa_system,Sets pa_system = 1,"$25,000 to install plus $2,000 per year ongoing maintenance"
+Rip-warning flags/signage,per beach,5000,one_off,flags,Sets flags = 1,Permanent rip-warning flags and signage
+,,,,,,
+,,,,,,
+,,,,,,
