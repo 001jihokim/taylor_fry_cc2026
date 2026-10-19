@@ -2,6 +2,7 @@
 # UNSW x TAYLOR FRY T3 2026 Case Competition
 # Team Name - Omega Consulting
 # Members - Jiho Kim, Becky Thai, Christina Lou, Timothy Bae
+
 # =============================================================================
 # 2026 ASOC x Taylor Fry Case Competition
 # Part A: data cleaning   |   Part B: Task 1 (forecast + drivers of incidents)
@@ -233,7 +234,12 @@ fit_count <- function(y, rhs, data) {
 
 # Backward selection by AIC on the full data to choose the final specification
 sel <- function(y, rhs) {
-  full <- fit_count(y, rhs, panel)
+  # NB: fit with data = panel (a global object) rather than via fit_count(), because
+  # stepAIC re-evaluates the model call and a function-argument called `data` is not found
+  f    <- as.formula(paste(y, "~", rhs, "+ offset(log(visitors))"))
+  full <- tryCatch(suppressWarnings(glm.nb(f, data = panel, control = glm.control(maxit = 200))),
+                   error = function(e) NULL)
+  if (is.null(full) || full$theta > 1e4) full <- glm(f, data = panel, family = poisson())
   st   <- suppressWarnings(stepAIC(full, direction = "backward", trace = FALSE))
   paste(attr(terms(st), "term.labels"), collapse = " + ")
 }
@@ -544,5 +550,3 @@ cor(agree$glm, agree$gbm, method = "spearman")             # rank agreement acro
 # - Spurious proxies (icecream_visits, n_bins) can survive selection - sanity-check
 #   signs/sizes before interpreting them.
 # =============================================================================
-
-
