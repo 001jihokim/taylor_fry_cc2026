@@ -1,202 +1,462 @@
-# =====================================================================
+######################################################################
 # 02_modelling.R
-# UNSW x TAYLOR FRY T3 2026 Case Competition - Omega Consulting
-# Members - Jiho Kim, Becky Thai, Christina Lou, Timothy Bae
+# 2026 UNSW ASOC x Taylor Fry Case Competition — Task 1
 #
-# Part 2 of 2: model validation, final models, drivers, 2026/27 forecast and scenarios.
-# Reads:  temp_output/clean/*.rds (from 01_setup_eda_cleaning.R)
-# Writes: temp_output/models/
+# Input:  temp_output/clean/model_df.rds (from 01_setup_eda_cleaning.R)
+#         OR model_df.rds in your working directory
+# Output: temp_output/modelling/*.csv, *.png, *.rds
 #
-# Derived from main.R (kept unchanged as the original). Differences from main.R:
-#   1. Data come from temp_output/clean/model_df.rds instead of being rebuilt here,
-#      so EDA and models use one definition of the data.
-#   2. Output csv is written to temp_output/models/ instead of the working directory.
-# Everything from section 2 onward is main.R's logic, unchanged.
-# NB theta is estimated by ML; the boosted model is xgboost.
-# =====================================================================
+# One outcome represents a PERSON involved, not a distinct incident_id.
+# Historical fiscal years run Sep-Aug (FY2026 = Sep 2025 to Aug 2026).
+# Forecast FY2027 = Sep 2026 to Aug 2027.
+#
+# Workflow:
+#   (1) Train FY2017-FY2024; select model using FY2025
+#   (2) Refit winner using FY2017-FY2025; test on FY2026
+#   (3) Refit winner on all data; forecast FY2027
+#
+# Optional: install glmmTMB and set RUN_GLMM <- TRUE to add a
+# beach-random-intercept negative binomial GLMM as a candidate.
+######################################################################
 
-# ---------------------------------------------------------------------
-# 0. SETUP (same paths as 01_setup_eda_cleaning.R)
-# ---------------------------------------------------------------------
-out_root  <- "temp_output"
-clean_dir <- file.path(out_root, "clean")
-model_dir <- file.path(out_root, "models")
-dir.create(model_dir, recursive = TRUE, showWarnings = FALSE)
-if (!file.exists(file.path(clean_dir, "model_df.rds")))
-  stop("Cleaned data not found. Run 01_setup_eda_cleaning.R first.", call. = FALSE)
-
-# Packages are installed by 01_setup_eda_cleaning.R. MASS is called as MASS:: (it masks dplyr::select).
-library(dplyr); library(tidyr); library(xgboost)
 set.seed(2026)
 
-# ---------------------------------------------------------------------
-# 1. DATA: one row per beach-month with counts of PEOPLE by severity (built in 01_setup_eda_cleaning.R)
-# ---------------------------------------------------------------------
-dat <- readRDS(file.path(clean_dir, "model_df.rds")) %>%
-  mutate(marine_health = as.character(marine_health),   # plain factor in formulas (as in main.R)
-         postcode      = as.integer(as.character(postcode)),
-         mh            = c(L = 0, M = 1, H = 2)[marine_health])
-inc <- readRDS(file.path(clean_dir, "incidents_clean.rds"))
-stopifnot(nrow(dat) == 9600, sum(dat$Severe) == sum(inc$inc_type == "Severe"))
-
-# NOT used as predictors (leakage / not known at forecast time): response_min and all
-# person-level fields in incidents.csv (age, sex, swim_level, alone, drone_present, n_lifeguards).
-
-# ---------------------------------------------------------------------
-# 2. QUICK CHECKS (full EDA is in 01_setup_eda_cleaning.R)
-# ---------------------------------------------------------------------
-cat("\nPeople by fiscal year\n")
-print(dat %>% group_by(fy) %>% summarise(visitors_m = sum(visitors)/1e6, Mild = sum(Mild),
-                                         CloseCall = sum(CloseCall), Severe = sum(Severe)))
-cat("\nSevere deaths per million visits, patrolled vs not\n")
-print(dat %>% group_by(patrolled) %>% summarise(sev_per_m = 1e6*sum(Severe)/sum(visitors),
-                                                close_per_m = 1e6*sum(CloseCall)/sum(visitors)))
-cat("\nBy calendar month\n")
-print(dat %>% group_by(cal_m) %>% summarise(visitors_m = sum(visitors)/1e6, Mild = sum(Mild), Severe = sum(Severe)))
-
-# ---------------------------------------------------------------------
-# 3. MODEL FORMULAS (rate model: counts ~ drivers with log(visitors) offset)
-# ---------------------------------------------------------------------
-RED  <- "patrolled + log1p(lg_hrs) + log1p(drone_hrs) + campaign_idx + I(first_aid_cap/10) +
-         pa_system + flags + I(equip_rating/10) + swell_avg_m + water_temp + tourist_ratio +
-         surfer_prop + n_rips + fishing + I(n_bins/10) + rockpool"
-FULL <- paste(RED, "+ swell_max_m + wind_days + air_temp_hi + I(rain_mm/100) + I(turbidity/10) +
-         icecream_visits + factor(marine_health) + I(shore_len_m/1000) + rocky")
-f_of <- function(y, rhs) as.formula(paste(y, "~", rhs, "+ offset(log(visitors))"))
-feats <- c("visitors","shore_len_m","n_rips","air_temp_hi","swell_avg_m","swell_max_m","wind_days","water_temp",
-           "rain_mm","turbidity","tourist_ratio","lg_hrs","drone_hrs","campaign_idx","first_aid_cap","pa_system",
-           "flags","patrolled","equip_rating","rocky","fishing","n_bins","rockpool","icecream_visits",
-           "surfer_prop","mh","cal_m")
-
-pdev <- function(y, mu) { mu <- pmax(mu, 1e-9); 2 * sum(ifelse(y > 0, y * log(pmax(y, 1) / mu), 0) - (y - mu)) }
-
-fit_xgb <- function(tr, y) {
-  d <- xgb.DMatrix(as.matrix(tr[, feats]), label = tr[[y]], base_margin = log(tr$visitors))
-  xgb.train(params = list(objective = "count:poisson", max_depth = 3, eta = 0.05,
-                          subsample = 0.8, colsample_bytree = 0.8, seed = 1), data = d, nrounds = 200, verbose = 0)
+required <- c("dplyr", "tidyr", "readr", "ggplot2", "MASS")
+missing <- required[!vapply(required, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing)) {
+  stop("Install missing packages first: install.packages(c(",
+       paste(sprintf('"%s"', missing), collapse = ", "), "))")
 }
-pred_xgb <- function(m, te) predict(m, xgb.DMatrix(as.matrix(te[, feats]), base_margin = log(te$visitors)))
 
-# ---------------------------------------------------------------------
-# 4. FORWARD (time-based) VALIDATION: train on years < t, test on t = 2024, 2025, 2026
-# ---------------------------------------------------------------------
-res <- list()
-for (y in c("Mild", "CloseCall", "Severe")) for (ty in 2024:2026) {
-  tr <- dat %>% filter(fy < ty); te <- dat %>% filter(fy == ty)
-  P <- list()
-  rate <- tr %>% group_by(beach_nm) %>% summarise(r = sum(.data[[y]]) / sum(visitors))
-  P[["Beach rate (naive)"]] <- rate$r[match(te$beach_nm, rate$beach_nm)] * te$visitors
-  P[["GLM full"]]    <- predict(glm(f_of(y, FULL), poisson, tr), te, type = "response")
-  P[["GLM reduced"]] <- predict(glm(f_of(y, RED),  poisson, tr), te, type = "response")
-  P[["NB reduced"]]  <- predict(MASS::glm.nb(f_of(y, RED), data = tr), te, type = "response")
-  P[["GBM (xgboost Poisson)"]] <- pred_xgb(fit_xgb(tr, y), te)
-  for (k in names(P)) {
-    mu <- P[[k]]; by <- data.frame(a = te[[y]], p = mu, b = te$beach_nm) %>% group_by(b) %>% summarise(a = sum(a), p = sum(p))
-    res[[length(res) + 1]] <- data.frame(sev = y, model = k, test_year = ty, deviance = pdev(te[[y]], mu) / nrow(te),
-                                         rmse_bm = sqrt(mean((te[[y]] - mu)^2)), rmse_beach_year = sqrt(mean((by$a - by$p)^2)),
-                                         actual = sum(te[[y]]), pred = sum(mu))
+library(dplyr)
+library(tidyr)
+library(readr)
+library(ggplot2)
+# MASS::glm.nb is explicitly namespaced to avoid masking dplyr::select.
+
+RUN_GLMM <- FALSE  # optional, may take considerably longer
+if (RUN_GLMM && !requireNamespace("glmmTMB", quietly = TRUE)) {
+  stop("Install glmmTMB first, or set RUN_GLMM <- FALSE")
+}
+
+source_candidates <- c("temp_output/clean/model_df.rds", "model_df.rds",
+                       "/mnt/data/model_df.rds")
+existing <- source_candidates[file.exists(source_candidates)]
+if (!length(existing)) stop("Cannot find model_df.rds. Run 01_setup_eda_cleaning.R first.")
+model_df <- readRDS(existing[1])
+
+out_dir <- "temp_output/modelling"
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+required_cols <- c("beach_nm", "date", "fy", "cal_m", "season",
+                   "visitors", "Mild", "CloseCall", "Severe", "Total",
+                   "lg_hrs", "drone_hrs", "log_lg_hrs", "log_drone_hrs",
+                   "campaign_idx", "first_aid_cap", "pa_system", "flags",
+                   "swell_max_m", "n_rips", "tourist_ratio", "surfer_prop",
+                   "rocky", "fishing")
+missing_cols <- setdiff(required_cols, names(model_df))
+if (length(missing_cols)) {
+  stop("model_df.rds is missing these columns: ", paste(missing_cols, collapse = ", "))
+}
+
+model_df <- model_df %>%
+  mutate(
+    date = as.Date(date),
+    fy = as.integer(fy),
+    beach_nm = factor(beach_nm),
+    season = factor(as.character(season),
+                    levels = c("Spring", "Summer", "Autumn", "Winter"))
+  ) %>%
+  arrange(beach_nm, date)
+
+stopifnot(nrow(model_df) == 9600,
+          all(model_df$visitors > 0),
+          !anyNA(model_df[, required_cols]),
+          all(model_df$Total == model_df$Mild + model_df$CloseCall + model_df$Severe),
+          all(table(model_df$beach_nm) == 120))
+
+# ---- Predictors -------------------------------------------------------
+# Safety levers retained for Task 2; associations are NOT automatically causal.
+# `patrolled` omitted: it is exactly lg_hrs > 0.
+# `swell_avg_m` omitted: high collinearity with swell_max_m.
+# Incident-only variables (response time, swimmer age, etc.) omitted to avoid leakage.
+
+frequent_vars <- c(
+  "season", "swell_max_m", "n_rips", "tourist_ratio", "surfer_prop",
+  "rocky", "fishing", "log_lg_hrs", "log_drone_hrs",
+  "campaign_idx", "first_aid_cap", "pa_system", "flags"
+)
+
+# Leaner formula because there are only 220 deaths in the entire dataset.
+severe_vars <- c(
+  "season", "swell_max_m", "n_rips", "tourist_ratio",
+  "log_lg_hrs", "log_drone_hrs", "campaign_idx", "first_aid_cap",
+  "pa_system", "flags"
+)
+
+# Stage 2 of frequency-severity challenger: chance of death among people
+# involved in an incident, not among all visitors.
+share_vars <- c(
+  "season", "swell_max_m", "n_rips", "tourist_ratio",
+  "log_lg_hrs", "log_drone_hrs", "campaign_idx", "first_aid_cap"
+)
+
+count_formula <- function(outcome) {
+  vars <- if (outcome == "Severe") severe_vars else frequent_vars
+  stats::reformulate(c(vars, "offset(log(visitors))"), response = outcome)
+}
+
+share_formula <- stats::reformulate(
+  share_vars, response = "cbind(Severe, Total - Severe)"
+)
+
+# ---- Model fitting / prediction -------------------------------------
+fit_candidate <- function(outcome, kind, data) {
+  if (kind == "Poisson") {
+    return(stats::glm(count_formula(outcome), family = poisson(link = "log"),
+                      data = data, control = glm.control(maxit = 100)))
+  }
+  if (kind == "NegBin") {
+    return(MASS::glm.nb(count_formula(outcome), data = data,
+                        control = glm.control(maxit = 100)))
+  }
+  if (kind == "NegBin_GLMM") {
+    f <- update(count_formula(outcome), . ~ . + (1 | beach_nm))
+    return(glmmTMB::glmmTMB(f, family = glmmTMB::nbinom2(link = "log"),
+                            data = data))
+  }
+  if (kind == "TwoStage" && outcome == "Severe") {
+    frequency <- MASS::glm.nb(count_formula("Total"), data = data,
+                              control = glm.control(maxit = 100))
+    severity_share <- stats::glm(share_formula,
+                                 family = binomial(link = "logit"),
+                                 data = data[data$Total > 0, ],
+                                 control = glm.control(maxit = 100))
+    return(list(frequency = frequency, share = severity_share))
+  }
+  stop("Unsupported model: ", outcome, "/", kind)
+}
+
+predict_candidate <- function(model, outcome, kind, newdata) {
+  if (kind == "TwoStage") {
+    expected_total <- as.numeric(predict(model$frequency, newdata = newdata,
+                                         type = "response"))
+    death_probability <- as.numeric(predict(model$share, newdata = newdata,
+                                            type = "response"))
+    pred <- expected_total * death_probability
+  } else {
+    pred <- as.numeric(predict(model, newdata = newdata, type = "response"))
+  }
+  if (any(!is.finite(pred)) || any(pred < 0)) {
+    stop("Nonfinite/negative predictions for ", outcome, "/", kind)
+  }
+  pred
+}
+
+kinds_for <- function(outcome) {
+  options <- c("Poisson", "NegBin")
+  if (RUN_GLMM && outcome != "Severe") options <- c(options, "NegBin_GLMM")
+  if (outcome == "Severe") options <- c(options, "TwoStage")
+  options
+}
+
+# ---- Out-of-time evaluation -----------------------------------------
+# Compare means on the SAME scale using Poisson deviance for all candidates.
+# This is a predictive comparison, even when a candidate uses a NB distribution.
+poisson_deviance <- function(observed, expected) {
+  expected <- pmax(expected, 1e-10)
+  positive <- observed > 0
+  2 * (sum(expected[!positive]) +
+         sum(observed[positive] * log(observed[positive] / expected[positive]) -
+               observed[positive] + expected[positive]))
+}
+
+evaluate <- function(observed, predicted, outcome, kind, split) {
+  tibble(
+    outcome = outcome, model = kind, split = split,
+    poisson_deviance = poisson_deviance(observed, predicted),
+    MAE = mean(abs(observed - predicted)),
+    RMSE = sqrt(mean((observed - predicted)^2)),
+    actual_total = sum(observed), predicted_total = sum(predicted),
+    actual_to_expected = ifelse(sum(predicted) > 0,
+                                sum(observed) / sum(predicted), NA_real_)
+  )
+}
+
+train <- model_df %>% filter(fy <= 2024)
+valid <- model_df %>% filter(fy == 2025)
+train_plus_valid <- model_df %>% filter(fy <= 2025)
+test <- model_df %>% filter(fy == 2026)
+stopifnot(nrow(train) > 0, nrow(valid) == 960, nrow(test) == 960)
+
+outcomes <- c("Mild", "CloseCall", "Severe", "Total")
+
+cat("\n=== 1. FITTING CANDIDATES; FY2025 VALIDATION ===\n")
+validation_rows <- list()
+for (y in outcomes) {
+  for (kind in kinds_for(y)) {
+    cat("Fit", y, kind, "...\n")
+    candidate <- tryCatch(fit_candidate(y, kind, train),
+                          error = function(e) {
+                            warning("Failed: ", y, "/", kind, ": ", conditionMessage(e))
+                            NULL
+                          })
+    if (is.null(candidate)) next
+    preds <- tryCatch(predict_candidate(candidate, y, kind, valid),
+                      error = function(e) {
+                        warning("Predict failed: ", y, "/", kind, ": ",
+                                conditionMessage(e))
+                        NULL
+                      })
+    if (is.null(preds)) next
+    validation_rows[[length(validation_rows) + 1L]] <-
+      evaluate(valid[[y]], preds, y, kind, "FY2025_validation")
   }
 }
-cvres <- bind_rows(res)
-cat("\nOut-of-sample scores (mean of 3 test years; lower deviance/RMSE is better)\n")
-print(cvres %>% group_by(sev, model) %>% summarise(deviance = mean(deviance), rmse_bm = mean(rmse_bm),
-                                                   rmse_beach_year = mean(rmse_beach_year), A_over_E = sum(actual) / sum(pred), .groups = "drop") %>%
-        arrange(sev, deviance), n = 20)
+validation <- dplyr::bind_rows(validation_rows)
+if (nrow(validation) == 0) stop("All model candidates failed.")
 
-# ---------------------------------------------------------------------
-# 5. FINAL MODELS on all data + diagnostics + AIC/BIC
-# ---------------------------------------------------------------------
-M <- list(); for (y in c("Mild", "CloseCall", "Severe")) {
-  M[[y]] <- list(pois = glm(f_of(y, RED), poisson, dat), full = glm(f_of(y, FULL), poisson, dat),
-                 nb = MASS::glm.nb(f_of(y, RED), data = dat))
-  cat(sprintf("\n%s | Pearson dispersion %.2f | AIC full %.0f, reduced %.0f, NB %.0f | BIC reduced %.0f, NB %.0f\n", y,
-              sum(residuals(M[[y]]$pois, "pearson")^2) / df.residual(M[[y]]$pois),
-              AIC(M[[y]]$full), AIC(M[[y]]$pois), AIC(M[[y]]$nb), BIC(M[[y]]$pois), BIC(M[[y]]$nb)))
+# Winning model per outcome is chosen ONLY from validation year FY2025.
+selected <- validation %>%
+  group_by(outcome) %>%
+  arrange(poisson_deviance, .by_group = TRUE) %>%
+  slice_head(n = 1) %>%
+  ungroup() %>%
+  select(outcome, model, validation_deviance = poisson_deviance)
+if (nrow(selected) != length(outcomes)) {
+  stop("At least one outcome has no valid model. See warnings above.")
 }
-# Actual vs fitted by fiscal year (check for bias)
-print(cbind(dat %>% group_by(fy) %>% summarise(Mild = sum(Mild), CC = sum(CloseCall), Sev = sum(Severe)),
-            fit_Mild = tapply(fitted(M$Mild$pois), dat$fy, sum), fit_Sev = tapply(fitted(M$Severe$pois), dat$fy, sum)))
 
-# ---------------------------------------------------------------------
-# 6. DRIVERS (severe model): rate ratios with 95% CI
-# ---------------------------------------------------------------------
-S <- M$Severe$pois; b <- coef(S); V <- vcov(S)
-rr <- function(contrast) { # contrast = named vector over coefficient names
-  v <- setNames(rep(0, length(b)), names(b)); v[names(contrast)] <- contrast
-  est <- sum(v * b); se <- sqrt(drop(t(v) %*% V %*% v)); exp(c(rr = est, lo = est - 1.96 * se, hi = est + 1.96 * se)) }
-drivers <- rbind(
-  "Non-local share (+1 SD)"      = rr(c(tourist_ratio = sd(dat$tourist_ratio))),
-  "Average swell (+1 SD)"        = rr(c(swell_avg_m = sd(dat$swell_avg_m))),
-  "Fishing spot (yes vs no)"     = rr(c(fishing = 1)),
-  "Rip currents (+1 SD)"         = rr(c(n_rips = sd(dat$n_rips))),
-  "Surfer share (+1 SD)"         = rr(c(surfer_prop = sd(dat$surfer_prop))),
-  "Rip flags (yes vs no)"        = rr(c(flags = 1)),
-  "Campaign 0.7 vs none"         = rr(c(campaign_idx = 0.7)),
-  "Drones 60 h/month vs none"    = rr(setNames(log(61), "log1p(drone_hrs)")),
-  "Lifeguards 600 h/month vs none" = rr(c(patrolled = 1, setNames(log(601), "log1p(lg_hrs)"))))
-cat("\nSevere-incident rate ratios\n"); print(round(drivers, 2))
+cat("\nSelected models (based on FY2025 deviance):\n")
+print(selected)
+write_csv(validation, file.path(out_dir, "01_validation_comparison.csv"))
+write_csv(selected, file.path(out_dir, "02_selected_models.csv"))
 
-# ---------------------------------------------------------------------
-# 7. FORECAST FRAME for 2026/27: last year's safety levels, 2024-26 average weather, visitors +2.5%
-# ---------------------------------------------------------------------
-wx <- c("air_temp_hi","swell_avg_m","swell_max_m","wind_days","water_temp","rain_mm","turbidity",
-        "tourist_ratio","surfer_prop","icecream_visits")
-avg <- dat %>% filter(fy >= 2024) %>% group_by(beach_nm, cal_m) %>% summarise(across(all_of(wx), mean), .groups = "drop")
-fc <- dat %>% filter(fy == 2026) %>% select(-all_of(wx)) %>% left_join(avg, by = c("beach_nm", "cal_m")) %>%
-  mutate(visitors = visitors * 1.025, fy = 2027)
+cat("\n=== 2. FINAL HOLDOUT TEST: FY2026 ===\n")
+test_rows <- list()
+test_predictions <- test %>%
+  select(beach_nm, date, fy, visitors, Mild, CloseCall, Severe, Total)
 
-# ---------------------------------------------------------------------
-# 8. POINT FORECAST + INTERVALS (coefficient uncertainty + negative binomial counts)
-# ---------------------------------------------------------------------
-fc$gbm_Mild      <- pred_xgb(fit_xgb(dat, "Mild"), fc)
-fc$gbm_CloseCall <- pred_xgb(fit_xgb(dat, "CloseCall"), fc)
-sim_total <- function(m, newd, nsim = 1000, theta = NULL) {
-  X <- model.matrix(delete.response(terms(m)), newd); off <- log(newd$visitors)
-  B <- MASS::mvrnorm(nsim, coef(m), vcov(m))
-  sapply(seq_len(nsim), function(j) { mu <- exp(drop(X %*% B[j, ]) + off)
-  sum(if (is.null(theta)) rpois(length(mu), mu) else rnbinom(length(mu), size = theta, mu = mu)) })
+for (i in seq_len(nrow(selected))) {
+  y <- selected$outcome[i]
+  kind <- selected$model[i]
+  fit <- fit_candidate(y, kind, train_plus_valid)
+  preds <- predict_candidate(fit, y, kind, test)
+  test_predictions[[paste0("pred_", y)]] <- preds
+  test_rows[[i]] <- evaluate(test[[y]], preds, y, kind, "FY2026_final_test")
 }
-out <- list()
-for (y in c("Mild", "CloseCall", "Severe")) {
-  m <- if (y == "Severe") M[[y]]$pois else M[[y]]$nb
-  th <- if (y == "Severe") NULL else m$theta
-  glm_pt <- sum(predict(m, fc, type = "response"))
-  pt <- if (y == "Severe") glm_pt else sum(fc[[paste0("gbm_", y)]])      # GBM point for mild/close call
-  sims <- sim_total(m, fc, theta = th) * pt / glm_pt                      # rescale range to the chosen point forecast
-  out[[y]] <- c(point = pt, glm_point = glm_pt, p05 = quantile(sims, .05), p95 = quantile(sims, .95),
-                p99 = quantile(sims, .99), TVaR95 = mean(sims[sims >= quantile(sims, .95)]))
+
+test_metrics <- bind_rows(test_rows)
+print(test_metrics)
+write_csv(test_metrics, file.path(out_dir, "03_final_test_metrics.csv"))
+write_csv(test_predictions, file.path(out_dir, "04_test_predictions.csv"))
+
+# Holdout-year calibration check by month (not used for model selection).
+test_by_month <- test_predictions %>%
+  mutate(cal_m = as.integer(format(date, "%m"))) %>%
+  group_by(cal_m) %>%
+  summarise(actual_severe = sum(Severe),
+            predicted_severe = sum(pred_Severe), .groups = "drop") %>%
+  arrange(match(cal_m, c(9:12, 1:8)))
+write_csv(test_by_month, file.path(out_dir, "04b_FY2026_severe_month_calibration.csv"))
+
+# ---- Build 2027 baseline inputs -------------------------------------
+# IMPORTANT: 2027's visits/weather are not observed yet.
+# Assumptions:
+#   - FY2027 monthly VISITS and WEATHER = average of FY2024-FY2026,
+#     calculated separately for EACH BEACH AND CALENDAR MONTH.
+#   - Safety provision and mostly-static characteristics = FY2026 values
+#     for the corresponding beach/month (no extra Task 2 funding).
+#   - No new unmodelled shocks or structural changes.
+# Replace these assumptions if the team develops a better forecast.
+
+cat("\n=== 3. CONSTRUCTING FY2027 BASELINE ===\n")
+climate_cols <- c("swell_max_m", "tourist_ratio", "surfer_prop")
+# These extra weather features are retained in the data for scenarios/EDA.
+extra_climate <- intersect(c("air_temp_hi", "swell_avg_m", "wind_days",
+                             "water_temp", "rain_mm", "turbidity"), names(model_df))
+climate_cols <- c(climate_cols, extra_climate)
+
+climatology <- model_df %>%
+  filter(fy %in% 2024:2026) %>%
+  group_by(beach_nm, cal_m) %>%
+  summarise(
+    visitors_forecast = mean(visitors),
+    across(all_of(climate_cols), mean, .names = "forecast_{.col}"),
+    .groups = "drop"
+  )
+
+future <- model_df %>%
+  filter(fy == 2026) %>%
+  select(-any_of(c("Mild", "CloseCall", "Severe", "Total", "n_events")),
+         -starts_with("cause_")) %>%
+  left_join(climatology, by = c("beach_nm", "cal_m")) %>%
+  mutate(visitors = pmax(1, round(visitors_forecast)))
+
+for (v in climate_cols) {
+  future[[v]] <- future[[paste0("forecast_", v)]]
 }
-cat("\n2026/27 forecast (people)\n"); print(round(do.call(rbind, out), 1))
+future <- future %>%
+  select(-visitors_forecast, -starts_with("forecast_")) %>%
+  mutate(
+    # Input dates are the 1st of each month, so adding 1 to calendar year is safe.
+    date = as.Date(sprintf("%04d-%02d-01",
+                           as.integer(format(date, "%Y")) + 1L, cal_m)),
+    fy = 2027L,
+    month = format(date, "%m/%Y"),
+    log_visitors = log(visitors),
+    log_lg_hrs = log1p(lg_hrs),
+    log_drone_hrs = log1p(drone_hrs)
+  ) %>%
+  arrange(beach_nm, date)
 
-# ---------------------------------------------------------------------
-# 9. WHERE AND WHEN
-# ---------------------------------------------------------------------
-fc$mu_Severe <- predict(M$Severe$pois, fc, type = "response")
-cat("\nTop 10 beaches by expected deaths\n")
-print(fc %>% group_by(beach_nm) %>% summarise(exp_deaths = sum(mu_Severe), visits_m = sum(visitors)/1e6) %>%
-        arrange(desc(exp_deaths)) %>% head(10))
-cat("\nBy calendar month\n")
-print(fc %>% group_by(cal_m) %>% summarise(mild = sum(gbm_Mild), close = sum(gbm_CloseCall), deaths = sum(mu_Severe)))
+stopifnot(nrow(future) == 960,
+          all(future$visitors > 0),
+          all(!is.na(future[, c(frequent_vars, "visitors")])) )
 
-# ---------------------------------------------------------------------
-# 10. SCENARIOS (GLM totals; relative to base)
-# ---------------------------------------------------------------------
-tot <- function(d) sapply(c("Mild", "CloseCall", "Severe"), function(y)
-  sum(predict(if (y == "Severe") M[[y]]$pois else M[[y]]$nb, d, type = "response")))
-b25 <- dat %>% filter(fy == 2025) %>% select(beach_nm, cal_m, camp25 = campaign_idx)
-scen <- list(
-  "Base"                         = fc,
-  "Visitors +5%"                 = mutate(fc, visitors = visitors / 1.025 * 1.05),
-  "Visitors flat"                = mutate(fc, visitors = visitors / 1.025),
-  "Visitors -10%"                = mutate(fc, visitors = visitors / 1.025 * 0.9),
-  "Non-local share +10%"         = mutate(fc, tourist_ratio = pmin(tourist_ratio * 1.1, 1)),
-  "Swell +20%"                   = mutate(fc, swell_avg_m = swell_avg_m * 1.2),
-  "Water temp +1C"               = mutate(fc, water_temp = water_temp + 1),
-  "Campaigns at 2024/25 level"   = left_join(fc, b25, by = c("beach_nm", "cal_m")) %>% mutate(campaign_idx = camp25),
-  "No campaigns"                 = mutate(fc, campaign_idx = 0),
-  "Lifeguard hours -10%"         = mutate(fc, lg_hrs = lg_hrs * 0.9))
-cat("\nScenarios (GLM expected people)\n"); print(round(t(sapply(scen, tot)), 1))
+write_csv(future, file.path(out_dir, "05_FY2027_assumed_inputs.csv"))
 
-write.csv(fc[, c("beach_nm", "month", "visitors", "gbm_Mild", "gbm_CloseCall", "mu_Severe")],
-          file.path(model_dir, "forecast_2026_27_by_beach_month.csv"), row.names = FALSE)
-cat("\nSaved forecast to", model_dir, "\n")
+# ---- Refit chosen models using ALL observed years --------------------
+cat("\n=== 4. REFIT WINNERS; FORECAST FY2027 ===\n")
+final_models <- list()
+forecast <- future %>%
+  select(beach_nm, date, month, cal_m, season, fy, postcode, visitors,
+         lg_hrs, drone_hrs, campaign_idx, first_aid_cap, pa_system, flags)
+
+for (i in seq_len(nrow(selected))) {
+  y <- selected$outcome[i]
+  kind <- selected$model[i]
+  fitted_model <- fit_candidate(y, kind, model_df)
+  final_models[[y]] <- list(kind = kind, fit = fitted_model)
+  forecast[[paste0("pred_", y)]] <- predict_candidate(fitted_model, y, kind, future)
+}
+
+# Coherent total is the sum of separately forecast severity counts.
+# pred_Total is retained as an independent model-check forecast.
+forecast <- forecast %>%
+  mutate(pred_Total_from_severities = pred_Mild + pred_CloseCall + pred_Severe)
+
+saveRDS(final_models, file.path(out_dir, "06_fitted_models.rds"))
+write_csv(forecast, file.path(out_dir, "07_FY2027_beach_month_forecast.csv"))
+
+# ---- Factor estimates (ASSOCIATIONS, not proven treatment effects) ---
+coefficient_rows <- list()
+append_coefficients <- function(fit, label, kind, interpretation) {
+  if (kind == "NegBin_GLMM") {
+    est_table <- as.matrix(summary(fit)$coefficients$cond)
+  } else {
+    est_table <- as.matrix(summary(fit)$coefficients)
+  }
+  tibble(
+    outcome = label, model = kind, effect_type = interpretation,
+    term = rownames(est_table),
+    estimate_log = as.numeric(est_table[, 1]),
+    std_error = as.numeric(est_table[, 2]),
+    ratio = exp(estimate_log),
+    lower_95 = exp(estimate_log - 1.96 * std_error),
+    upper_95 = exp(estimate_log + 1.96 * std_error)
+  )
+}
+for (y in outcomes) {
+  item <- final_models[[y]]
+  if (item$kind == "TwoStage") {
+    coefficient_rows[[length(coefficient_rows) + 1L]] <-
+      append_coefficients(item$fit$frequency, "Total (frequency stage)",
+                          "TwoStage_NB", "Incident-rate ratio")
+    coefficient_rows[[length(coefficient_rows) + 1L]] <-
+      append_coefficients(item$fit$share, "Severe | incident (share stage)",
+                          "TwoStage_logistic", "Conditional odds ratio")
+  } else {
+    coefficient_rows[[length(coefficient_rows) + 1L]] <-
+      append_coefficients(item$fit, y, item$kind, "Incident-rate ratio")
+  }
+}
+coefficients <- bind_rows(coefficient_rows)
+write_csv(coefficients, file.path(out_dir, "08_driver_associations.csv"))
+
+# ---- Tables for the presentation ------------------------------------
+statewide <- forecast %>%
+  summarise(
+    Mild = sum(pred_Mild),
+    CloseCall = sum(pred_CloseCall),
+    Severe = sum(pred_Severe),
+    Total_from_severities = sum(pred_Total_from_severities),
+    Total_independent_model = sum(pred_Total),
+    Forecast_visits = sum(visitors)
+  )
+write_csv(statewide, file.path(out_dir, "09_FY2027_statewide_summary.csv"))
+
+by_month <- forecast %>%
+  group_by(cal_m) %>%
+  summarise(
+    visits = sum(visitors), Mild = sum(pred_Mild),
+    CloseCall = sum(pred_CloseCall), Severe = sum(pred_Severe),
+    .groups = "drop"
+  ) %>%
+  arrange(match(cal_m, c(9:12, 1:8))) %>%
+  mutate(month = factor(month.abb[cal_m], levels = month.abb[c(9:12, 1:8)]))
+write_csv(by_month, file.path(out_dir, "10_FY2027_by_month.csv"))
+
+by_beach <- forecast %>%
+  group_by(beach_nm, postcode) %>%
+  summarise(
+    visits = sum(visitors), Mild = sum(pred_Mild),
+    CloseCall = sum(pred_CloseCall), Severe = sum(pred_Severe),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Total = Mild + CloseCall + Severe,
+    severe_per_million_visits = Severe / visits * 1e6
+  ) %>%
+  arrange(desc(Severe))
+write_csv(by_beach, file.path(out_dir, "11_FY2027_beach_ranking.csv"))
+
+# Monthly predicted outcomes by severity.
+plot_month <- by_month %>%
+  pivot_longer(c(Mild, CloseCall, Severe), names_to = "severity", values_to = "expected") %>%
+  ggplot(aes(x = month, y = expected)) +
+  geom_col(fill = "#2471A3") +
+  facet_wrap(~ severity, scales = "free_y", ncol = 1) +
+  labs(title = "FY2027 expected beach incidents by month",
+       subtitle = "Person-level outcomes; Sep 2026 to Aug 2027",
+       x = "Calendar month", y = "Expected people") +
+  theme_minimal(base_size = 12)
+
+ggsave(file.path(out_dir, "12_monthly_forecast.png"), plot_month,
+       width = 10, height = 8, dpi = 200)
+
+plot_beaches <- by_beach %>%
+  slice_max(Severe, n = 15, with_ties = FALSE) %>%
+  mutate(beach_nm = reorder(as.character(beach_nm), Severe)) %>%
+  ggplot(aes(x = Severe, y = beach_nm)) +
+  geom_col(fill = "#C0392B") +
+  labs(title = "FY2027: beaches with the highest expected deaths",
+       x = "Expected deaths", y = NULL) +
+  theme_minimal(base_size = 12)
+
+ggsave(file.path(out_dir, "13_top_beaches_expected_deaths.png"), plot_beaches,
+       width = 10, height = 6, dpi = 200)
+
+# ---- Sensitivity to unknown visitor volumes -------------------------
+# Illustrative +/-10% visitor scenarios, holding other drivers fixed.
+# This is NOT a causal estimate of changing safety interventions.
+visitor_scenarios <- bind_rows(lapply(c(0.9, 1, 1.1), function(multiplier) {
+  scenario <- future
+  scenario$visitors <- pmax(1, round(scenario$visitors * multiplier))
+  scenario$log_visitors <- log(scenario$visitors)
+  out <- tibble(visitor_multiplier = multiplier)
+  for (y in c("Mild", "CloseCall", "Severe")) {
+    obj <- final_models[[y]]
+    out[[y]] <- sum(predict_candidate(obj$fit, y, obj$kind, scenario))
+  }
+  out
+}))
+write_csv(visitor_scenarios, file.path(out_dir, "14_visitor_sensitivity.csv"))
+
+cat("\n=== FY2027 STATEWIDE EXPECTED PEOPLE ===\n")
+print(statewide)
+cat("\n=== TOP 10 BEACHES BY EXPECTED DEATHS ===\n")
+print(by_beach %>% select(beach_nm, Severe, severe_per_million_visits) %>% head(10))
+cat("\nSaved all modelling results to: ", normalizePath(out_dir), "\n", sep = "")
+cat("\nIMPORTANT: Coefficients describe conditional associations, not\n",
+    "causal safety-intervention effects. FY2027 inputs are assumed.\n", sep = "")
