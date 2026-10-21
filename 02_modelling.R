@@ -15,6 +15,15 @@
 #   (2) Refit winner using FY2017-FY2025; test on FY2026
 #   (3) Refit winner on all data; forecast FY2027
 #
+# TwoStage is now compared for ALL three severity outcomes: Mild,
+# CloseCall, and Severe (but NOT Total, because Total / Total = 1).
+# Its first stage predicts Total with a negative binomial model;
+# its second stage models the probability of the target severity
+# among people involved in incidents, using grouped binomial GLM.
+#
+# FY2026 comparisons for all candidates are exported for diagnostic
+# transparency; model selection STILL uses only FY2025 validation.
+#
 # Optional: install glmmTMB and set RUN_GLMM <- TRUE to add a
 # beach-random-intercept negative binomial GLMM as a candidate.
 ######################################################################
@@ -94,8 +103,9 @@ severe_vars <- c(
   "pa_system", "flags"
 )
 
-# Stage 2 of frequency-severity challenger: chance of death among people
-# involved in an incident, not among all visitors.
+# Stage 2 of the frequency-severity challenger: chance of the
+# specified severity given that a person was involved in an incident.
+# Models Mild, CloseCall and Severe separately as one-vs-rest shares.
 share_vars <- c(
   "season", "swell_max_m", "n_rips", "tourist_ratio",
   "log_lg_hrs", "log_drone_hrs", "campaign_idx", "first_aid_cap"
@@ -106,9 +116,15 @@ count_formula <- function(outcome) {
   stats::reformulate(c(vars, "offset(log(visitors))"), response = outcome)
 }
 
-share_formula <- stats::reformulate(
-  share_vars, response = "cbind(Severe, Total - Severe)"
-)
+share_formula <- function(outcome) {
+  if (!outcome %in% c("Mild", "CloseCall", "Severe")) {
+    stop("TwoStage share is only meaningful for severity outcomes, not Total")
+  }
+  stats::reformulate(
+    share_vars,
+    response = sprintf("cbind(%s, Total - %s)", outcome, outcome)
+  )
+}
 
 # ---- Model fitting / prediction -------------------------------------
 fit_candidate <- function(outcome, kind, data) {
@@ -125,10 +141,13 @@ fit_candidate <- function(outcome, kind, data) {
     return(glmmTMB::glmmTMB(f, family = glmmTMB::nbinom2(link = "log"),
                             data = data))
   }
-  if (kind == "TwoStage" && outcome == "Severe") {
+  if (kind == "TwoStage" && outcome %in% c("Mild", "CloseCall", "Severe")) {
+    # Stage 1: expected TOTAL person-level incidents per beach-month.
     frequency <- MASS::glm.nb(count_formula("Total"), data = data,
                               control = glm.control(maxit = 100))
-    severity_share <- stats::glm(share_formula,
+    # Stage 2: conditional share of the requested severity. Zero-incident
+    # months cannot inform the conditional share, but remain in Stage 1.
+    severity_share <- stats::glm(share_formula(outcome),
                                  family = binomial(link = "logit"),
                                  data = data[data$Total > 0, ],
                                  control = glm.control(maxit = 100))
@@ -141,9 +160,9 @@ predict_candidate <- function(model, outcome, kind, newdata) {
   if (kind == "TwoStage") {
     expected_total <- as.numeric(predict(model$frequency, newdata = newdata,
                                          type = "response"))
-    death_probability <- as.numeric(predict(model$share, newdata = newdata,
-                                            type = "response"))
-    pred <- expected_total * death_probability
+    severity_probability <- as.numeric(predict(model$share, newdata = newdata,
+                                               type = "response"))
+    pred <- expected_total * severity_probability
   } else {
     pred <- as.numeric(predict(model, newdata = newdata, type = "response"))
   }
@@ -156,7 +175,9 @@ predict_candidate <- function(model, outcome, kind, newdata) {
 kinds_for <- function(outcome) {
   options <- c("Poisson", "NegBin")
   if (RUN_GLMM && outcome != "Severe") options <- c(options, "NegBin_GLMM")
-  if (outcome == "Severe") options <- c(options, "TwoStage")
+  if (outcome %in% c("Mild", "CloseCall", "Severe")) {
+    options <- c(options, "TwoStage")
+  }
   options
 }
 
@@ -234,21 +255,54 @@ write_csv(selected, file.path(out_dir, "02_selected_models.csv"))
 
 cat("\n=== 2. FINAL HOLDOUT TEST: FY2026 ===\n")
 test_rows <- list()
+all_test_rows <- list()
 test_predictions <- test %>%
   select(beach_nm, date, fy, visitors, Mild, CloseCall, Severe, Total)
 
-for (i in seq_len(nrow(selected))) {
-  y <- selected$outcome[i]
-  kind <- selected$model[i]
-  fit <- fit_candidate(y, kind, train_plus_valid)
-  preds <- predict_candidate(fit, y, kind, test)
-  test_predictions[[paste0("pred_", y)]] <- preds
-  test_rows[[i]] <- evaluate(test[[y]], preds, y, kind, "FY2026_final_test")
+# Refit EVERY candidate on train + validation to report FY2026 diagnostics.
+# Importantly, FY2026 is never used to choose the winner: selected was
+# already locked using FY2025 validation deviance.
+for (y in outcomes) {
+  winner <- selected$model[selected$outcome == y]
+  for (kind in kinds_for(y)) {
+    cat("Test", y, kind, "...\n")
+    fit <- tryCatch(fit_candidate(y, kind, train_plus_valid),
+                    error = function(e) {
+                      warning("Holdout fit failed: ", y, "/", kind, ": ",
+                              conditionMessage(e))
+                      NULL
+                    })
+    if (is.null(fit)) {
+      if (kind == winner) stop("Chosen model failed on FY2026: ", y, "/", kind)
+      next
+    }
+    preds <- tryCatch(predict_candidate(fit, y, kind, test),
+                      error = function(e) {
+                        warning("Holdout predict failed: ", y, "/", kind, ": ",
+                                conditionMessage(e))
+                        NULL
+                      })
+    if (is.null(preds)) {
+      if (kind == winner) stop("Chosen model could not predict FY2026: ", y, "/", kind)
+      next
+    }
+    diagnostic <- evaluate(test[[y]], preds, y, kind, "FY2026_diagnostic")
+    all_test_rows[[length(all_test_rows) + 1L]] <- diagnostic
+    if (kind == winner) {
+      test_predictions[[paste0("pred_", y)]] <- preds
+      test_rows[[length(test_rows) + 1L]] <-
+        evaluate(test[[y]], preds, y, kind, "FY2026_final_test")
+    }
+  }
 }
 
+all_test_metrics <- bind_rows(all_test_rows)
 test_metrics <- bind_rows(test_rows)
+stopifnot(nrow(test_metrics) == length(outcomes))
 print(test_metrics)
 write_csv(test_metrics, file.path(out_dir, "03_final_test_metrics.csv"))
+write_csv(all_test_metrics,
+          file.path(out_dir, "03b_all_candidate_test_metrics.csv"))
 write_csv(test_predictions, file.path(out_dir, "04_test_predictions.csv"))
 
 # Holdout-year calibration check by month (not used for model selection).
@@ -331,7 +385,11 @@ for (i in seq_len(nrow(selected))) {
   forecast[[paste0("pred_", y)]] <- predict_candidate(fitted_model, y, kind, future)
 }
 
-# Coherent total is the sum of separately forecast severity counts.
+# The sum of independently selected severity forecasts is the
+# accounting total. It need not equal pred_Total from the independently
+# fitted Total model. If different outcomes select two-stage models,
+# their one-vs-rest probabilities are estimated separately and may not
+# sum exactly to one (even when using the same frequency stage).
 # pred_Total is retained as an independent model-check forecast.
 forecast <- forecast %>%
   mutate(pred_Total_from_severities = pred_Mild + pred_CloseCall + pred_Severe)
@@ -361,10 +419,12 @@ for (y in outcomes) {
   item <- final_models[[y]]
   if (item$kind == "TwoStage") {
     coefficient_rows[[length(coefficient_rows) + 1L]] <-
-      append_coefficients(item$fit$frequency, "Total (frequency stage)",
+      append_coefficients(item$fit$frequency,
+                          paste0(y, " / Total (frequency stage)"),
                           "TwoStage_NB", "Incident-rate ratio")
     coefficient_rows[[length(coefficient_rows) + 1L]] <-
-      append_coefficients(item$fit$share, "Severe | incident (share stage)",
+      append_coefficients(item$fit$share,
+                          paste0(y, " | incident (share stage)"),
                           "TwoStage_logistic", "Conditional odds ratio")
   } else {
     coefficient_rows[[length(coefficient_rows) + 1L]] <-
