@@ -103,9 +103,22 @@ price_raw <- read_csv(file.path(data_dir, "pricing.csv"), show_col_types = FALSE
 ######################################################################
 # PART 2 CLEANING
 ######################################################################
+# Summary of fixes (detail and reasoning at each step below)
+#   1. inc_cause missing (1,764 rows, all children): inherit the cause recorded for an
+#      adult in the same incident (140 rows); label the rest "Unspecified" (1,624)  -> 2.3
+#   2. surfer missing (1,734 rows): labelled "Unknown", rows kept                 -> 2.3
+#   3. response_min outliers (max 5,801 min): remove the reporting delay to give an
+#      on-scene response time (max 320 min); original column kept                -> 2.3
+#   Smaller fixes:
+#   - three blank rows dropped from pricing.csv                                   -> 2.1
+#   - values sitting exactly on a limit flagged, not altered                      -> 2.2
+#   - FY2020-21 flagged as a dip period                                           -> 2.2
+#   Modelling table: people counted by beach-month and severity, zero-filled, with
+#   checks that all 33,941 people and all 220 deaths survive the join             -> 2.4
+#   Excluded from the models: person-level fields and response time               -> 2.3
 
 ######################################################################
-# 2.1 pricing - drop the trailing blank rows, tidy text
+# 2.1 pricing - drop the three trailing blank rows, tidy text
 pricing <- price_raw %>%
   filter(!is.na(item)) %>%
   mutate(
@@ -147,14 +160,54 @@ beach <- beach_raw %>%
     drone_any      = as.integer(drone_hrs > 0),
     campaign_any   = as.integer(campaign_idx > 0),
     
-    # environmental values on a bound - kept as-is, flagged for sensitivity tests
-    cap_flag = as.integer(rain_mm >= 700 | turbidity %in% c(0, 100) | swell_max_m >= 5),
+    # values sitting exactly on a limit suggest capping in the source data. They are
+    # flagged, not altered, so models can be re-run without them as a sensitivity test
+    cap_flag = as.integer(rain_mm >= 700 | turbidity %in% c(0, 100) |
+                            swell_max_m >= 5 | drone_hrs >= 150),
     # FY2020-21: visits and incidents both dip, then recover - flag to test a level shift
     dip_fy2020_21 = as.integer(fy %in% c(2020, 2021))
   )
 
+# count of beach-months on each limit. first_aid_cap and equip_rating are shown for
+# reference only: 100 is the natural ceiling of those indices, so they are not flagged
+on_limit <- tibble(
+  var     = c("rain_mm", "turbidity", "turbidity", "swell_max_m", "drone_hrs",
+              "first_aid_cap", "equip_rating"),
+  limit   = c(700, 0, 100, 5, 150, 100, 100),
+  flagged = c(TRUE, TRUE, TRUE, TRUE, TRUE, FALSE, FALSE)
+)
+on_limit$beach_months <- mapply(function(v, x) sum(beach[[v]] == x), on_limit$var, on_limit$limit)
+
+cat("\n== Beach-months sitting exactly on a limit ==\n")
+print(on_limit)
+cat(sprintf("cap_flag = 1 for %d beach-months\n", sum(beach$cap_flag)))
+
 ######################################################################
 # 2.3 incident (person-level) table
+#
+# Fix 1 - missing inc_cause (1,764 rows, all children)
+#   What: 140 rows take the cause recorded for an adult in the same incident; the
+#         other 1,624 are labelled "Unspecified".
+#   Why:  cause is an incident-level field, so a child in a family incident shares the
+#         adult's cause. Imputing anything beyond that would be guessing.
+#
+# Fix 2 - missing surfer (1,734 rows)
+#   What: labelled "Unknown" rather than dropping the rows.
+#   Why:  the ages and severities of these rows look like the rest of the data, which
+#         suggests they are missing at random. Dropping rows would undercount incidents
+#         at beach-month level, which feeds the forecast directly.
+#
+# Fix 3 - response_min outliers (max 5,801 min, about 4 days)
+#   Cause: the dictionary says the measure includes reporting delay. All 52 extreme
+#          values are incidents reported 1-4 days late, each adding ~1,440 min per day.
+#   What:  subtracting that delay gives an on-scene response time (response_onscene)
+#          with a clean maximum of 320 min; the original column is kept.
+#   Why:   these 52 rows would otherwise dominate any average response time.
+#
+# Fields deliberately excluded from the models (kept here for description only):
+#   person-level fields such as swim_level, age and alone describe who had an incident,
+#   not the beach population, and are unknown when forecasting. Response time is
+#   excluded too, because it is only observed after an incident has happened.
 inc <- inc_raw %>%
   mutate(
     d_occ = dmy(dte_occurred),
@@ -163,15 +216,14 @@ inc <- inc_raw %>%
     cal_m = month(d_occ),
     fy    = fy_of(d_occ),
     
-    # response_min includes the reporting delay (dictionary): incidents reported on a later
-    # day carry ~1,440 min per day of lag, so keep the original and add an on-scene measure
+    # Fix 3: remove the reporting delay from response_min
     report_lag_days  = as.integer(d_rep - d_occ),
     late_report      = as.integer(report_lag_days > 0),
     response_onscene = response_min - 1440 * report_lag_days,
     
     inc_type   = factor(inc_type, levels = c("Mild", "CloseCall", "Severe"), ordered = TRUE),
     swim_level = factor(swim_level, levels = c("beginner", "intermediate", "experienced"), ordered = TRUE),
-    # surfer has blanks the dictionary does not mention - kept as their own level, not imputed
+    # Fix 2: missing surfer -> "Unknown"
     surfer     = factor(
       case_when(is.na(surfer) ~ "Unknown", surfer == 1 ~ "Yes", TRUE ~ "No"),
       levels = c("No", "Yes", "Unknown")
@@ -183,8 +235,7 @@ inc <- inc_raw %>%
     drone_present   = as.integer(drone_present == "Y"),
     in_patrol_hours = as.integer(n_lifeguards > 0)
   ) %>%
-  # inc_cause is incident-level but NA for some children: inherit the cause recorded
-  # for someone else in the same incident, otherwise mark as Unspecified
+  # Fix 1: inherit inc_cause from the same incident, otherwise "Unspecified"
   group_by(incident_id) %>%
   mutate(
     n_people  = n(),
@@ -204,9 +255,12 @@ cat(sprintf("response_min: %d late reports; on-scene max %.0f min (raw max %.0f)
 
 ######################################################################
 # 2.4 beach-month modelling table (dictionary s6)
-# PEOPLE (rows) are the unit for severity because inc_type is person-level and the
-# client objective counts severe outcomes. EVENTS (distinct incident_id) are kept for
-# reference. Beach-months with no incidents are zero-filled.
+# Incident rows are aggregated to PEOPLE by beach-month and severity, then joined to
+# the monthly data. People are the unit because inc_type is person-level and the client
+# objective counts severe outcomes. EVENTS (distinct incident_id) are kept for reference.
+# Months with no incidents are set to ZERO, not missing: 98% of beach-months have zero
+# deaths, and those zeros are real information. The checks below confirm all 33,941
+# people and all 220 deaths survive the join.
 
 people_counts <- inc %>%
   count(beach_nm, month, inc_type) %>%
@@ -235,6 +289,9 @@ stopifnot(
   sum(model_df$Severe)   == sum(inc$inc_type == "Severe"),
   sum(model_df$n_events) == n_distinct(inc$incident_id)
 )
+
+cat(sprintf("\nmodel_df: %d beach-months, %d people and %d deaths after the join; %.1f%% of beach-months have zero deaths\n",
+            nrow(model_df), sum(model_df$Total), sum(model_df$Severe), 100 * mean(model_df$Severe == 0)))
 
 ######################################################################
 # 2.5 postcode-month table (dictionary s6)
