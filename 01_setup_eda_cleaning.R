@@ -6,7 +6,7 @@
 # Part 1 of 2: setup, import, cleaning, EDA and pre-modelling checks
 #   Reads:  data/*.csv               (raw data, never modified)
 #   Writes: temp_output/clean/*.rds  (model-ready tables, read by 02_modelling.R)
-#           temp_output/eda/         (Figure 1.x / 2.x as .png, tables as .csv)
+#           temp_output/eda/         (Figure 3.x / 4.x as .png, tables as .csv)
 #
 # Assumption: the data provided are accurate to the data dictionary, so no separate
 # validation step is run. Cleaning only handles what the dictionary itself describes
@@ -111,8 +111,12 @@ price_raw <- read_csv(file.path(data_dir, "pricing.csv"), show_col_types = FALSE
 #      on-scene response time (max 320 min); original column kept                -> 2.3
 #   Smaller fixes:
 #   - three blank rows dropped from pricing.csv                                   -> 2.1
-#   - values sitting exactly on a limit flagged, not altered                      -> 2.2
 #   - FY2020-21 flagged as a dip period                                           -> 2.2
+#   - values sitting exactly on a limit (e.g. rain at 700 mm) are kept as-is, with
+#     no flag: a sensitivity analysis on them adds complexity for little benefit
+#   Variable choice: patrolled is dropped as a model predictor because it is exactly
+#   lg_hrs > 0, so it is collinear with lifeguard hours by construction           -> 2.2
+#   icecream_visits and n_bins are dropped as predictors: crowd / heat proxies    -> 4.3
 #   Modelling table: people counted by beach-month and severity, zero-filled, with
 #   checks that all 33,941 people and all 220 deaths survive the join             -> 2.4
 #   Excluded from the models: person-level fields and response time               -> 2.3
@@ -148,39 +152,18 @@ beach <- beach_raw %>%
     
     # exposure and intensity measures
     log_visitors   = log(visitors),
+    # lifeguards enter the models as log_lg_hrs only. patrolled (= lg_hrs > 0) stays in
+    # the data for description but is not a predictor: log_lg_hrs is 0 exactly when
+    # patrolled is 0, so the two are collinear by construction
     log_lg_hrs     = log1p(lg_hrs),       # lg_hrs is 0 at unpatrolled beach-months
     log_drone_hrs  = log1p(drone_hrs),    # drone_hrs is 0 in 77% of beach-months
     lg_hrs_per_10k = 1e4 * lg_hrs / visitors,
-    log_lg_per_10k = log1p(lg_hrs_per_10k),
-    # patrolled is exactly lg_hrs > 0, so patrolled and log_lg_hrs are collinear by
-    # construction. lg_intensity = log hours centred among patrolled months (0 when not
-    # patrolled) removes that, and patrolled then reads as 'patrol at average hours'
-    lg_intensity   = ifelse(patrolled == 1,
-                            log(lg_hrs) - mean(log(lg_hrs[patrolled == 1])), 0),
     drone_any      = as.integer(drone_hrs > 0),
     campaign_any   = as.integer(campaign_idx > 0),
     
-    # values sitting exactly on a limit suggest capping in the source data. They are
-    # flagged, not altered, so models can be re-run without them as a sensitivity test
-    cap_flag = as.integer(rain_mm >= 700 | turbidity %in% c(0, 100) |
-                            swell_max_m >= 5 | drone_hrs >= 150),
     # FY2020-21: visits and incidents both dip, then recover - flag to test a level shift
     dip_fy2020_21 = as.integer(fy %in% c(2020, 2021))
   )
-
-# count of beach-months on each limit. first_aid_cap and equip_rating are shown for
-# reference only: 100 is the natural ceiling of those indices, so they are not flagged
-on_limit <- tibble(
-  var     = c("rain_mm", "turbidity", "turbidity", "swell_max_m", "drone_hrs",
-              "first_aid_cap", "equip_rating"),
-  limit   = c(700, 0, 100, 5, 150, 100, 100),
-  flagged = c(TRUE, TRUE, TRUE, TRUE, TRUE, FALSE, FALSE)
-)
-on_limit$beach_months <- mapply(function(v, x) sum(beach[[v]] == x), on_limit$var, on_limit$limit)
-
-cat("\n== Beach-months sitting exactly on a limit ==\n")
-print(on_limit)
-cat(sprintf("cap_flag = 1 for %d beach-months\n", sum(beach$cap_flag)))
 
 ######################################################################
 # 2.3 incident (person-level) table
@@ -345,7 +328,7 @@ cat("\nSaved cleaned data to", clean_dir, "\n")
 # crude rates are per million visits. They are NOT causal - see Part 4 for confounding.
 
 ######################################################################
-# Figure 1.1: trend by fiscal year
+# Figure 3.1: trend by fiscal year
 by_fy <- rate_tab(model_df, fy)
 save_tab(by_fy, "t01_by_fiscal_year")
 cat("\n== By fiscal year ==\n")
@@ -360,7 +343,7 @@ plot_fy_counts <- by_fy %>%
   facet_wrap(~ sev, scales = "free_y") +
   scale_colour_manual(values = sev_cols, guide = "none") +
   scale_x_continuous(breaks = seq(2017, 2026, by = 3)) +
-  labs(title = "Figure 1.1: People involved in incidents by fiscal year",
+  labs(title = "Figure 3.1: People involved in incidents by fiscal year",
        x = "Fiscal year (Sep-Aug)", y = "People")
 
 plot_fy_rate <- ggplot(by_fy, aes(x = fy)) +
@@ -371,16 +354,16 @@ plot_fy_rate <- ggplot(by_fy, aes(x = fy)) +
   labs(title = "Deaths per million visits (bars) vs total visits (line)",
        x = "Fiscal year", y = "Deaths per million visits")
 
-save_fig(plot_fy_counts / plot_fy_rate, "f1_1_trend_by_fy", height = 7)
+save_fig(plot_fy_counts / plot_fy_rate, "f3_1_trend_by_fy", height = 7)
 
 ######################################################################
-# Figure 1.2: seasonality - when do incidents happen?
+# Figure 3.2: seasonality - when do incidents happen?
 by_month <- rate_tab(model_df, month_lab)
 save_tab(by_month, "t02_by_calendar_month")
 
 plot_month_vol <- ggplot(by_month, aes(x = month_lab, y = visitors_m)) +
   geom_col(fill = "grey60") +
-  labs(title = "Figure 1.2: Visits by month (exposure)", x = NULL, y = "Visits (m), 10 years")
+  labs(title = "Figure 3.2: Visits by month (exposure)", x = NULL, y = "Visits (m), 10 years")
 
 plot_month_rate <- by_month %>%
   pivot_longer(c(mild_per_m, close_per_m, severe_per_m), names_to = "sev", values_to = "rate") %>%
@@ -393,10 +376,10 @@ plot_month_rate <- by_month %>%
   labs(title = "Incident rate per million visits by month", x = NULL, y = "People per million visits")
 
 save_fig(plot_month_vol / plot_month_rate + plot_layout(heights = c(1, 3)),
-         "f1_2_seasonality", height = 8)
+         "f3_2_seasonality", height = 8)
 
 ######################################################################
-# Figure 1.3: time of day, and whether lifeguards were on duty
+# Figure 3.3: time of day, and whether lifeguards were on duty
 by_hour <- inc %>%
   group_by(inc_hour, inc_type) %>%
   summarise(people = n(), on_duty = mean(in_patrol_hours), .groups = "drop") %>%
@@ -408,7 +391,7 @@ plot_hour_share <- ggplot(by_hour, aes(x = inc_hour, y = share, colour = inc_typ
   geom_line(linewidth = 1) +
   scale_colour_manual(values = sev_cols) +
   scale_y_continuous(labels = percent) +
-  labs(title = "Figure 1.3: Time of day incidents occur (share within severity)",
+  labs(title = "Figure 3.3: Time of day incidents occur (share within severity)",
        x = NULL, y = NULL, colour = NULL)
 
 plot_hour_duty <- inc %>%
@@ -420,10 +403,10 @@ plot_hour_duty <- inc %>%
   labs(title = "Share of incidents with a lifeguard on duty", x = "Hour", y = NULL)
 
 save_fig(plot_hour_share / plot_hour_duty + plot_layout(heights = c(2, 1)),
-         "f1_3_hour_of_day", height = 6)
+         "f3_3_hour_of_day", height = 6)
 
 ######################################################################
-# Figure 1.4: where - beach-level deaths vs visits (small beaches have noisy rates)
+# Figure 3.4: where - beach-level deaths vs visits (small beaches have noisy rates)
 by_beach <- rate_tab(model_df, beach_nm) %>%
   left_join(beach_static, by = "beach_nm") %>%
   arrange(desc(Severe))
@@ -438,13 +421,13 @@ plot_beach <- ggplot(by_beach, aes(x = visitors_m, y = Severe, colour = factor(e
             size = 2.8, vjust = -0.8, check_overlap = TRUE, show.legend = FALSE) +
   scale_colour_manual(values = c(`0` = "#C0392B", `1` = "#2471A3"),
                       labels = c("Never patrolled", "Patrolled (some months)")) +
-  labs(title = "Figure 1.4: Deaths vs visits by beach, 10 years",
+  labs(title = "Figure 3.4: Deaths vs visits by beach, 10 years",
        x = "Visits (millions)", y = "Deaths", colour = NULL)
 
-save_fig(plot_beach, "f1_4_beach_deaths_vs_visits")
+save_fig(plot_beach, "f3_4_beach_deaths_vs_visits")
 
 ######################################################################
-# Figure 1.5: one-way analysis of categorical drivers
+# Figure 3.5: one-way analysis of categorical drivers
 cat_vars <- c("patrolled", "flags", "pa_system", "drone_any", "campaign_any",
               "fishing", "rocky", "rockpool", "marine_health", "season")
 
@@ -457,16 +440,16 @@ save_tab(oneway_cat, "t04_oneway_categorical")
 plot_cat <- ggplot(oneway_cat, aes(x = level, y = severe_per_m)) +
   geom_col(fill = sev_cols["Severe"]) +
   facet_wrap(~ var, scales = "free_x", nrow = 2) +
-  labs(title = "Figure 1.5: Crude deaths per million visits by beach feature", x = NULL, y = NULL)
+  labs(title = "Figure 3.5: Crude deaths per million visits by beach feature", x = NULL, y = NULL)
 
-save_fig(plot_cat, "f1_5_oneway_categorical", width = 10, height = 5)
+save_fig(plot_cat, "f3_5_oneway_categorical", width = 10, height = 5)
 
 ######################################################################
-# Figure 1.6: one-way analysis of continuous drivers (rate by quintile)
+# Figure 3.6: one-way analysis of continuous drivers (rate by quintile)
 cont_vars <- c("swell_avg_m", "swell_max_m", "n_rips", "tourist_ratio", "surfer_prop",
                "water_temp", "air_temp_hi", "wind_days", "rain_mm", "turbidity",
                "lg_hrs_per_10k", "drone_hrs", "campaign_idx", "first_aid_cap",
-               "equip_rating", "icecream_visits", "n_bins", "shore_len_m")
+               "equip_rating", "shore_len_m")   # crowd proxies excluded (see Part 4)
 
 oneway_cont <- bind_rows(lapply(cont_vars, function(v) {
   model_df %>%
@@ -495,13 +478,13 @@ plot_cont <- oneway_cont %>%
   facet_wrap(~ var, ncol = 6) +
   scale_colour_manual(values = c(severe_per_m = unname(sev_cols["Severe"]), total_per_m = "grey40"),
                       labels = c(severe_per_m = "Deaths", total_per_m = "All incidents")) +
-  labs(title = "Figure 1.6: Relative incident rate by quintile of each variable (1 = average)",
+  labs(title = "Figure 3.6: Relative incident rate by quintile of each variable (1 = average)",
        x = "Quintile (low -> high)", y = "Relative rate", colour = NULL)
 
-save_fig(plot_cont, "f1_6_oneway_continuous", width = 12, height = 6.5)
+save_fig(plot_cont, "f3_6_oneway_continuous", width = 12, height = 6.5)
 
 ######################################################################
-# Figure 1.7: who - share of people in an incident who died
+# Figure 3.7: who - share of people in an incident who died
 # descriptive only: person-level fields are not known in advance, so NOT model predictors
 person_profile <- function(v) {
   inc %>%
@@ -522,14 +505,14 @@ plot_person <- ggplot(person_tab, aes(x = level, y = severe_share)) +
   geom_col(fill = sev_cols["Severe"]) +
   facet_wrap(~ var, scales = "free_x", ncol = 3) +
   scale_y_continuous(labels = percent) +
-  labs(title = "Figure 1.7: Share of people in an incident who died, by characteristic",
+  labs(title = "Figure 3.7: Share of people in an incident who died, by characteristic",
        x = NULL, y = NULL) +
   theme(axis.text.x = element_text(angle = 30, hjust = 1))
 
-save_fig(plot_person, "f1_7_person_profile", width = 10, height = 8)
+save_fig(plot_person, "f3_7_person_profile", width = 10, height = 8)
 
 ######################################################################
-# response time vs safety resources (on-scene response, late reports excluded)
+# Figure 3.8: response time vs safety resources (on-scene response, late reports excluded)
 resp <- inc %>%
   filter(late_report == 0) %>%
   distinct(incident_id, .keep_all = TRUE) %>%
@@ -541,25 +524,59 @@ resp <- inc %>%
     .groups     = "drop"
   )
 save_tab(resp, "t07_response_time")
-cat("\n== On-scene response time (min) by lifeguards on duty (3 = 3+) and drone ==\n")
-print(resp)
+
+plot_resp <- resp %>%
+  mutate(
+    lifeguards = factor(n_lifeguards, levels = 0:3, labels = c("0", "1", "2", "3+")),
+    drone      = ifelse(drone_present == 1, "Drone flying", "No drone")
+  ) %>%
+  ggplot(aes(x = lifeguards, y = median_resp, fill = drone)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  geom_errorbar(aes(ymin = median_resp, ymax = p90_resp),
+                position = position_dodge(width = 0.8), width = 0.2, colour = "grey30") +
+  scale_fill_manual(values = c("No drone" = "grey60", "Drone flying" = "#2471A3")) +
+  labs(title = "Figure 3.8: On-scene response time by lifeguards on duty and drone",
+       subtitle = "Bar = median, line = up to 90th percentile; late reports excluded",
+       x = "Lifeguards on duty", y = "Minutes", fill = NULL)
+
+save_fig(plot_resp, "f3_8_response_time")
 
 ######################################################################
-# natural experiments - beaches that installed a PA system or flags mid-period
+# Figure 3.9: natural experiments - beaches that installed a PA system or flags mid-period
 installs <- model_df %>%
   group_by(beach_nm) %>%
   filter(n_distinct(pa_system) > 1 | n_distinct(flags) > 1) %>%
-  group_by(beach_nm, pa_system, flags) %>%
+  mutate(installed = case_when(
+    n_distinct(pa_system) > 1 & n_distinct(flags) > 1 ~ "PA system and flags",
+    n_distinct(pa_system) > 1                         ~ "PA system",
+    TRUE                                              ~ "Flags"
+  )) %>%
+  group_by(beach_nm, installed, pa_system, flags) %>%
   summarise(
+    start       = min(date),
     months      = n(),
     visitors_m  = sum(visitors) / 1e6,
     total_per_m = sum(Total) / visitors_m,
     severe      = sum(Severe),
     .groups     = "drop"
-  )
+  ) %>%
+  group_by(beach_nm) %>%
+  mutate(period = factor(ifelse(start == min(start), "Before", "After"),
+                         levels = c("Before", "After"))) %>%
+  ungroup()
 save_tab(installs, "t08_install_before_after")
-cat("\n== Beaches that installed a PA system / flags (before vs after) ==\n")
-print(installs, n = 40)
+
+plot_installs <- ggplot(installs, aes(x = total_per_m, y = beach_nm)) +
+  geom_line(aes(group = beach_nm), colour = "grey70") +
+  geom_point(aes(colour = period, size = months)) +
+  geom_text(aes(label = paste0(severe, " d")), size = 2.6, vjust = -1.1, colour = "grey30") +
+  facet_wrap(~ installed, scales = "free_y", ncol = 1) +
+  scale_colour_manual(values = c(Before = "grey50", After = "#2471A3")) +
+  labs(title = "Figure 3.9: Incident rate before vs after PA or flag installs",
+       subtitle = "Label = deaths in that period. Short periods (small points) are noisy",
+       x = "All incidents per million visits", y = NULL, colour = NULL, size = "Months")
+
+save_fig(plot_installs, "f3_9_install_before_after", height = 6)
 
 
 ######################################################################
@@ -576,12 +593,15 @@ print(installs, n = 40)
 
 # candidate predictors, on the scale they would enter a rate model
 # (visitors is the exposure, so it is an offset rather than a predictor)
-levers   <- c("patrolled", "log_lg_hrs", "log_drone_hrs", "campaign_idx",
+# patrolled is not a candidate: it is exactly lg_hrs > 0 (see 2.2)
+# icecream_visits and n_bins are not candidates: they are crowd / heat proxies that
+# track visitors and temperature rather than drive risk (evidence printed in 4.3)
+levers   <- c("log_lg_hrs", "log_drone_hrs", "campaign_idx",
               "first_aid_cap", "pa_system", "flags")
 env_vars <- c("equip_rating", "swell_avg_m", "swell_max_m", "wind_days", "water_temp",
               "air_temp_hi", "rain_mm", "turbidity", "tourist_ratio", "surfer_prop",
-              "icecream_visits", "n_bins", "n_rips", "shore_len_m", "rocky", "fishing",
-              "rockpool", "marine_health")
+              "n_rips", "shore_len_m", "rocky", "fishing", "rockpool", "marine_health")
+crowd_proxies <- c("icecream_visits", "n_bins")
 cand_vars <- c(levers, env_vars)
 
 rate_formula <- function(y, vars) {
@@ -627,9 +647,38 @@ plot_dist <- model_df %>%
   geom_histogram(binwidth = 1) +
   facet_wrap(~ sev, scales = "free") +
   scale_fill_manual(values = sev_cols, guide = "none") +
-  labs(title = "Figure 2.1: People per beach-month", x = "Count", y = "Beach-months")
+  labs(title = "Figure 4.1a: People per beach-month", x = "Count", y = "Beach-months")
 
-save_fig(plot_dist, "f2_1_response_distribution")
+save_fig(plot_dist, "f4_1a_response_distribution")
+
+disp_long <- disp %>%
+  mutate(sev = factor(sev, levels = c("Mild", "CloseCall", "Severe", "Total")))
+
+plot_disp <- disp_long %>%
+  select(sev, `Crude var / mean` = var_to_mean, `Pearson, after drivers` = pearson_disp) %>%
+  pivot_longer(-sev, names_to = "measure", values_to = "value") %>%
+  ggplot(aes(x = sev, y = value, fill = measure)) +
+  geom_col(position = "dodge") +
+  geom_hline(yintercept = 1, linetype = "dashed") +
+  scale_fill_manual(values = c("grey60", "#2471A3")) +
+  labs(title = "Figure 4.1b: Over-dispersion (1 = Poisson)", x = NULL, y = "Dispersion", fill = NULL)
+
+plot_zeros <- disp_long %>%
+  transmute(sev, Observed = zeros_observed / nrow(model_df),
+            `Poisson expected` = zeros_poisson_exp / nrow(model_df)) %>%
+  pivot_longer(-sev, names_to = "measure", values_to = "share") %>%
+  ggplot(aes(x = sev, y = share, fill = measure)) +
+  geom_col(position = "dodge") +
+  scale_y_continuous(labels = percent) +
+  scale_fill_manual(values = c("grey30", "#F5B041")) +
+  labs(title = "Zero beach-months: observed vs Poisson-expected", x = NULL, y = NULL, fill = NULL)
+
+plot_aic <- disp_long %>%
+  ggplot(aes(x = sev, y = aic_poisson - aic_nb)) +
+  geom_col(fill = "#2471A3") +
+  labs(title = "AIC improvement from negative binomial over Poisson", x = NULL, y = "AIC drop")
+
+save_fig(plot_disp / plot_zeros / plot_aic, "f4_1b_dispersion_and_zeros", height = 8)
 
 ######################################################################
 # 4.2 exposure: an offset assumes incidents are proportional to visits (slope = 1)
@@ -657,6 +706,17 @@ save_tab(exposure, "t10_exposure_slope")
 cat("\n== 4.2 Exposure check: slope on log(visitors) (offset assumes 1) ==\n")
 print(exposure)
 
+plot_exposure <- exposure %>%
+  mutate(sev = factor(sev, levels = c("Mild", "CloseCall", "Severe", "Total"))) %>%
+  ggplot(aes(x = sev, y = slope, colour = controls)) +
+  geom_hline(yintercept = 1, linetype = "dashed") +
+  geom_pointrange(aes(ymin = lower_95, ymax = upper_95), position = position_dodge(width = 0.5)) +
+  scale_colour_manual(values = c("grey50", "#2471A3")) +
+  labs(title = "Figure 4.2: Slope on log(visits) with 95% CI (offset assumes 1)",
+       x = NULL, y = "Slope", colour = "Controls")
+
+save_fig(plot_exposure, "f4_2_exposure_slope")
+
 ######################################################################
 # 4.3 correlation among candidate predictors (Spearman: robust to skew and 0/1 vars)
 corr_df  <- model_df %>%
@@ -664,10 +724,10 @@ corr_df  <- model_df %>%
   select(all_of(cand_vars), log_visitors)
 corr_mat <- cor(corr_df, method = "spearman")
 
-png(file.path(eda_dir, "f2_2_correlation.png"), width = 2000, height = 2000, res = 220)
+png(file.path(eda_dir, "f4_3_correlation.png"), width = 2000, height = 2000, res = 220)
 corrplot(corr_mat, method = "color", type = "upper", order = "hclust",
          tl.col = "black", tl.cex = 0.7, diag = FALSE,
-         title = "Figure 2.2: Spearman correlation of candidate predictors", mar = c(0, 0, 2, 0))
+         title = "Figure 4.3: Spearman correlation of candidate predictors", mar = c(0, 0, 2, 0))
 invisible(dev.off())
 
 high_cor <- as.data.frame(as.table(corr_mat)) %>%
@@ -676,6 +736,13 @@ high_cor <- as.data.frame(as.table(corr_mat)) %>%
   rename(var_1 = Var1, var_2 = Var2, rho = Freq)
 cat("\n== 4.3 Predictor pairs with |Spearman rho| > 0.6 ==\n")
 print(high_cor)
+
+# evidence for dropping the crowd proxies: how closely they track crowds and heat
+proxy_cor <- cor(model_df[crowd_proxies],
+                 model_df[c("log_visitors", "air_temp_hi", "log_lg_hrs")],
+                 method = "spearman")
+cat("\n== 4.3b Crowd proxies vs visits, heat and lifeguard hours (Spearman rho) ==\n")
+print(round(proxy_cor, 2))
 
 ######################################################################
 # 4.4 variance inflation factors
@@ -704,8 +771,7 @@ cat("\n== 4.4a VIF, all candidate predictors (> 5 worth watching, > 10 serious) 
 print(vif_full, n = Inf)
 
 # drop the highest-VIF variable one at a time until every VIF <= 5. The safety levers
-# are protected: Task 2 needs their effects, so collinearity among them is handled by
-# reparameterising (see notes) rather than by dropping one.
+# are protected: Task 2 needs their effects, so they are never dropped.
 keep_vars <- cand_vars
 vif_steps <- tibble()
 repeat {
@@ -724,34 +790,27 @@ print(vif_steps)
 cat("\n== 4.4c VIF of the reduced candidate set ==\n")
 print(vif_reduced, n = Inf)
 
-# the protected levers patrolled and log_lg_hrs remain collinear (patrolled = lg_hrs > 0).
-# compare ways of entering lifeguard hours: VIF of the lifeguard terms, and AIC
-lg_options <- list(
-  "patrolled + log_lg_hrs"     = c("patrolled", "log_lg_hrs"),
-  "log_lg_hrs only"            = "log_lg_hrs",
-  "patrolled + lg_intensity"   = c("patrolled", "lg_intensity"),
-  "patrolled + log_lg_per_10k" = c("patrolled", "log_lg_per_10k")
-)
-other_vars <- setdiff(keep_vars, c("patrolled", "log_lg_hrs"))
+plot_vif <- bind_rows(
+  vif_full    %>% mutate(set = "All candidates"),
+  vif_reduced %>% mutate(set = "After pruning")
+) %>%
+  mutate(set = factor(set, levels = c("All candidates", "After pruning")),
+         var = factor(var, levels = rev(vif_full$var))) %>%
+  ggplot(aes(x = vif_glm, y = var, fill = set)) +
+  geom_col(position = position_dodge(preserve = "single"), width = 0.8) +
+  geom_vline(xintercept = 5,  linetype = "dashed") +
+  geom_vline(xintercept = 10, linetype = "dotted") +
+  scale_fill_manual(values = c("grey60", "#2471A3")) +
+  labs(title = "Figure 4.4: Variance inflation factors (Poisson-weighted)",
+       subtitle = "Dashed = 5 (worth watching), dotted = 10 (serious). Missing blue bar = dropped",
+       x = "VIF", y = NULL, fill = NULL)
 
-lg_compare <- bind_rows(lapply(names(lg_options), function(opt) {
-  vars <- c(lg_options[[opt]], other_vars)
-  v    <- vif_table(vars) %>% filter(var %in% lg_options[[opt]])
-  tibble(
-    option         = opt,
-    max_lg_vif     = max(v$vif_glm),
-    aic_total      = AIC(glm(rate_formula("Total",  c(vars, "month_lab")), family = poisson, data = model_df)),
-    aic_severe     = AIC(glm(rate_formula("Severe", c(vars, "month_lab")), family = poisson, data = model_df))
-  )
-}))
-save_tab(lg_compare, "t14_lifeguard_parameterisation")
-cat("\n== 4.4d Lifeguard parameterisations (VIF of lifeguard terms, AIC with month) ==\n")
-print(lg_compare)
+save_fig(plot_vif, "f4_4_vif", height = 6.5)
 
 ######################################################################
 # 4.5 confounding with season
 # patrols run mainly Sep-Apr and campaigns only Nov-Feb, so the crude 'patrolled' and
-# 'campaign' effects in Figure 1.5 partly measure the season. Compare within season.
+# 'campaign' effects in Figure 3.5 partly measure the season. Compare within season.
 coverage <- model_df %>%
   group_by(month_lab) %>%
   summarise(
@@ -768,14 +827,14 @@ plot_coverage <- coverage %>%
   scale_fill_manual(values = c(patrolled_share = "#2471A3", campaign_share = "#F5B041"),
                     labels = c(campaign_share = "Campaign active", patrolled_share = "Patrolled")) +
   scale_y_continuous(labels = percent) +
-  labs(title = "Figure 2.3: Safety coverage by month vs death rate",
+  labs(title = "Figure 4.5a: Safety coverage by month vs death rate",
        x = NULL, y = "Share of beach-months", fill = NULL)
 
 plot_coverage_rate <- ggplot(coverage, aes(x = month_lab, y = severe_per_m)) +
   geom_col(fill = sev_cols["Severe"]) +
   labs(x = NULL, y = "Deaths per million visits")
 
-save_fig(plot_coverage / plot_coverage_rate, "f2_3_seasonal_confounding", height = 6)
+save_fig(plot_coverage / plot_coverage_rate, "f4_5a_seasonal_coverage", height = 6)
 
 strat_patrol <- model_df %>%
   mutate(season_grp = ifelse(patrol_season == 1, "Sep-Apr", "May-Aug")) %>%
@@ -801,12 +860,48 @@ strat_campaign <- model_df %>%
     .groups      = "drop"
   )
 
-save_tab(strat_patrol,   "t15_patrolled_within_season")
-save_tab(strat_campaign, "t16_campaign_within_nov_feb")
+save_tab(strat_patrol,   "t14_patrolled_within_season")
+save_tab(strat_campaign, "t15_campaign_within_nov_feb")
 cat("\n== 4.5a Patrolled vs not, within season ==\n")
 print(strat_patrol)
 cat("\n== 4.5b Campaign vs none, Nov-Feb only ==\n")
 print(strat_campaign)
+
+# crude all-month comparisons, to show how much of each gap is season
+crude_rates <- function(df, flag) {
+  df %>%
+    group_by(with_flag = .data[[flag]]) %>%
+    summarise(severe_per_m = 1e6 * sum(Severe) / sum(visitors),
+              total_per_m  = 1e6 * sum(Total) / sum(visitors), .groups = "drop")
+}
+
+strat_plot_df <- bind_rows(
+  crude_rates(model_df, "patrolled") %>%
+    mutate(comparison = "Patrolled\nall months (crude)"),
+  strat_patrol %>%
+    transmute(comparison = paste0("Patrolled\n", season_grp, " only"), with_flag = patrolled,
+              severe_per_m, total_per_m),
+  crude_rates(model_df, "campaign_any") %>%
+    mutate(comparison = "Campaign\nall months (crude)"),
+  strat_campaign %>%
+    transmute(comparison = "Campaign\nNov-Feb only", with_flag = campaign_any,
+              severe_per_m, total_per_m)
+) %>%
+  mutate(group      = ifelse(with_flag == 1, "With", "Without"),
+         comparison = factor(comparison, levels = unique(comparison))) %>%
+  pivot_longer(c(severe_per_m, total_per_m), names_to = "measure", values_to = "rate") %>%
+  mutate(measure = ifelse(measure == "severe_per_m", "Deaths per million visits",
+                          "All incidents per million visits"))
+
+plot_strat <- ggplot(strat_plot_df, aes(x = comparison, y = rate, fill = group)) +
+  geom_col(position = "dodge") +
+  facet_wrap(~ measure, scales = "free_y", ncol = 1) +
+  scale_fill_manual(values = c(With = "#2471A3", Without = "grey60")) +
+  labs(title = "Figure 4.5b: Patrol and campaign gaps, crude vs within season",
+       subtitle = "If the gap shrinks within season, part of the crude effect is the season",
+       x = NULL, y = NULL, fill = NULL)
+
+save_fig(plot_strat, "f4_5b_within_season", width = 9, height = 6)
 
 ######################################################################
 # 4.6 within- vs between-beach variation
@@ -827,9 +922,23 @@ variation <- bind_rows(lapply(cand_vars, function(v) {
 })) %>%
   arrange(within_share)
 
-save_tab(variation, "t17_within_beach_variation")
+save_tab(variation, "t16_within_beach_variation")
 cat("\n== 4.6 Share of each predictor's variance that is within-beach ==\n")
 print(variation, n = Inf)
+
+plot_variation <- variation %>%
+  mutate(var    = factor(var, levels = var),
+         is_lever = ifelse(var %in% levers, "Safety lever", "Other driver")) %>%
+  ggplot(aes(x = within_share, y = var, fill = is_lever)) +
+  geom_col() +
+  geom_text(aes(label = paste0(beaches_changing, " beaches")), hjust = -0.1, size = 2.6) +
+  scale_x_continuous(labels = percent, limits = c(0, 1.15), breaks = seq(0, 1, 0.25)) +
+  scale_fill_manual(values = c("Safety lever" = "#2471A3", "Other driver" = "grey60")) +
+  labs(title = "Figure 4.6: Share of each predictor's variation that is within beaches",
+       subtitle = "Near 0% = effect only estimable by comparing beaches. Label = beaches where it changes",
+       x = NULL, y = NULL, fill = NULL)
+
+save_fig(plot_variation, "f4_6_within_beach_variation", height = 6.5)
 
 ######################################################################
 # 4.7 time and beach effects the drivers do not capture
@@ -847,9 +956,40 @@ lrt_time <- bind_rows(lapply(c("Total", "Severe"), function(y) {
   }
   bind_rows(lr(add_fy, "fiscal year"), lr(add_dip, "FY2020-21 dip flag"))
 }))
-save_tab(lrt_time, "t18_lrt_time_effects")
+save_tab(lrt_time, "t17_lrt_time_effects")
 cat("\n== 4.7a LR tests: does a year effect remain after the drivers? ==\n")
 print(lrt_time)
+
+# a year effect is easier to judge from the actual vs expected ratio for each year
+year_ae <- bind_rows(lapply(c("Total", "Severe"), function(y) {
+  base <- glm(rate_formula(y, c(keep_vars, "month_lab")), family = poisson, data = model_df)
+  model_df %>%
+    mutate(expected = fitted(base)) %>%
+    group_by(fy) %>%
+    summarise(actual = sum(.data[[y]]), expected = sum(expected), .groups = "drop") %>%
+    mutate(sev = y, a_over_e = actual / expected,
+           lower = qchisq(0.025, 2 * actual) / 2 / expected,          # exact Poisson 95% CI
+           upper = qchisq(0.975, 2 * (actual + 1)) / 2 / expected)
+}))
+
+lrt_label <- lrt_time %>%
+  filter(added == "fiscal year") %>%
+  transmute(sev, label = sprintf("LR test for year: p = %s", format.pval(p_value, digits = 2)))
+
+plot_year <- year_ae %>%
+  left_join(lrt_label, by = "sev") %>%
+  mutate(sev = paste0(sev, " (", label, ")")) %>%
+  ggplot(aes(x = fy, y = a_over_e)) +
+  geom_hline(yintercept = 1, linetype = "dashed") +
+  annotate("rect", xmin = 2019.5, xmax = 2021.5, ymin = -Inf, ymax = Inf, alpha = 0.1) +
+  geom_pointrange(aes(ymin = lower, ymax = upper), colour = "#2471A3") +
+  facet_wrap(~ sev, ncol = 1, scales = "free_y") +
+  scale_x_continuous(breaks = 2017:2026) +
+  labs(title = "Figure 4.7a: Actual / expected by fiscal year after the drivers",
+       subtitle = "Shaded = FY2020-21 dip. Points away from 1 = a year effect the drivers miss",
+       x = "Fiscal year", y = "Actual / expected")
+
+save_fig(plot_year, "f4_7a_year_effects", height = 6)
 
 # (b) beaches: actual vs expected by beach. A fixed beach factor cannot be fitted for
 # Severe (many beaches have zero deaths, so their coefficients run off to -Inf), so test
@@ -876,17 +1016,47 @@ beach_het <- beach_ae %>%
     .groups        = "drop"
   )
 
-save_tab(beach_ae,  "t19_beach_actual_vs_expected")
-save_tab(beach_het, "t20_beach_heterogeneity")
+save_tab(beach_ae,  "t18_beach_actual_vs_expected")
+save_tab(beach_het, "t19_beach_heterogeneity")
 cat("\n== 4.7b Beach heterogeneity after the drivers (beach-level A vs E) ==\n")
 print(beach_het, width = Inf)
+
+# funnel plot: with no beach effect, beaches fall inside the 95% band around 1
+het_label <- beach_het %>%
+  transmute(sev, label = sprintf("%s (X^2/df = %.1f)", sev, x2_over_df))
+
+beach_ae_plot <- beach_ae %>%
+  left_join(het_label, by = "sev") %>%
+  mutate(z = (actual - expected) / sqrt(expected))
+
+funnel <- beach_ae_plot %>%
+  group_by(label) %>%
+  reframe(expected = exp(seq(log(min(expected)), log(max(expected)), length.out = 100))) %>%
+  mutate(lower = pmax(1 - 1.96 / sqrt(expected), 0),
+         upper = 1 + 1.96 / sqrt(expected))
+
+plot_beach_ae <- ggplot(beach_ae_plot, aes(x = expected, y = a_over_e)) +
+  geom_ribbon(data = funnel, aes(x = expected, ymin = lower, ymax = upper),
+              inherit.aes = FALSE, fill = "grey85") +
+  geom_hline(yintercept = 1, linetype = "dashed") +
+  geom_point(aes(colour = abs(z) > 1.96), alpha = 0.8) +
+  geom_text(data = beach_ae_plot %>% group_by(label) %>% slice_max(abs(z), n = 4),
+            aes(label = beach_nm), size = 2.5, vjust = -0.8, check_overlap = TRUE) +
+  facet_wrap(~ label, scales = "free") +
+  scale_x_log10(expand = expansion(mult = c(0.05, 0.25))) +
+  scale_colour_manual(values = c(`FALSE` = "grey40", `TRUE` = "#C0392B"), guide = "none") +
+  labs(title = "Figure 4.7b: Actual / expected by beach after the drivers",
+       subtitle = "Grey band = 95% range if there were no beach effect; red = outside it",
+       x = "Expected people, 10 years (log scale)", y = "Actual / expected")
+
+save_fig(plot_beach_ae, "f4_7b_beach_actual_vs_expected", width = 10)
 
 ######################################################################
 # 4.8 sample size for the severe model
 # rule of thumb: >= 10 events per estimated parameter
 n_severe  <- sum(model_df$Severe)
-n_params  <- length(coef(glm(rate_formula("Severe", keep_vars), family = poisson, data = model_df)))
-cat(sprintf("\n== 4.8 Severe model: %d deaths / %d parameters (reduced set) = %.1f deaths per parameter ==\n",
+n_params  <- length(coef(glm(rate_formula("Severe", c(keep_vars, "month_lab")), family = poisson, data = model_df)))
+cat(sprintf("\n== 4.8 Severe model: %d deaths / %d parameters (reduced set + month) = %.1f deaths per parameter ==\n",
             n_severe, n_params, n_severe / n_params))
 if (n_severe / n_params < 10) {
   cat("Below 10: the severe model needs fewer terms, or should borrow strength from the\n")
@@ -897,9 +1067,10 @@ if (n_severe / n_params < 10) {
 # 4.9 variables that must NOT be used as predictors
 cat("\n== 4.9 Excluded from modelling ==\n")
 cat("- response_min, n_lifeguards, drone_present and all person fields: recorded after\n")
-cat("  the incident, not known in advance (leakage). Descriptive only (Figure 1.7).\n")
-cat("- icecream_visits, n_bins: proxies for crowd size and heat, not levers. Keep only\n")
-cat("  if they improve out-of-sample fit, and never interpret their coefficients.\n")
+cat("  the incident, not known in advance (leakage). Descriptive only (Figure 3.7).\n")
+cat("- icecream_visits, n_bins: proxies for crowd size and heat, not drivers of risk\n")
+cat("  (correlations in 4.3). Dropped: visitors is already the offset and temperature\n")
+cat("  is measured directly, so they would only blur the real effects.\n")
 cat("- visitors: the exposure. Enters as offset(log(visitors)), not as a predictor.\n")
 
 cat("\nSaved EDA and pre-modelling outputs to", eda_dir, "\n")
@@ -908,24 +1079,25 @@ cat("\nSaved EDA and pre-modelling outputs to", eda_dir, "\n")
 ######################################################################
 # PRE-MODELLING NOTES (from the run on data to Aug 2026 - re-check if the data change)
 ######################################################################
-# 1. Distribution: Mild / Total over-dispersed after the drivers (Pearson ~2, NB AIC much
-#    lower) -> negative binomial. Severe ~ Poisson (Pearson ~1.05). Observed zeros match
-#    what the fitted models expect -> no zero-inflation needed.
-# 2. Exposure: with all drivers the log(visitors) slope is ~0.9 for Total and 1 is
-#    inside the CI for Severe -> offset(log(visitors)) is reasonable; a sensitivity with
-#    log(visitors) as a free covariate is worth reporting for Mild / Total.
-# 3. Multicollinearity: swell_avg_m vs swell_max_m (rho 0.97) and air_temp_hi vs
-#    water_temp / icecream_visits push VIFs over 5 -> drop swell_avg_m and air_temp_hi.
-#    patrolled vs log_lg_hrs is structural (patrolled = lg_hrs > 0): use
-#    patrolled + lg_intensity (VIF ~2, same fit) instead of patrolled + log_lg_hrs.
-# 4. Confounding: patrols run Sep-Apr and campaigns Nov-Feb only, so crude effects
-#    include the season. Always adjust for month / season; within season the patrolled
-#    and campaign gaps shrink but remain (t15, t16).
-# 5. Identification: pa_system and flags change at only 6 beaches each, and the static
-#    beach features never change -> their effects come from comparing beaches and may
-#    absorb unmeasured beach risk. Treat as weaker evidence than the lifeguard / drone /
-#    campaign effects, which vary within beaches.
-# 6. Beach and time effects: strong unexplained beach heterogeneity for Total (X^2/df
-#    ~18) -> beach random effects or credibility weighting for 'where'. A year effect
-#    remains for Total but not Severe; the FY2020-21 dip is explained by the drivers.
-# 7. Severe has ~9 deaths per parameter -> keep the severe model lean.
+# 1. Distribution (Fig 4.1): Mild / Total over-dispersed after the drivers (Pearson
+#    ~2.1-2.3, NB AIC ~3,500-4,100 lower) -> negative binomial. Severe is close to
+#    Poisson (Pearson ~1.2, NB improves AIC by only ~2). Observed zeros are within ~3%
+#    of what the fitted models expect -> no zero-inflation needed.
+# 2. Exposure (Fig 4.2): with all drivers the log(visitors) slope is ~0.86 for Total and
+#    1 is inside the CI for Severe -> offset(log(visitors)) is reasonable for Severe; a
+#    sensitivity with log(visitors) as a free covariate is worth reporting for Mild / Total.
+# 3. Multicollinearity (Fig 4.3, 4.4): with patrolled and the crowd proxies removed,
+#    the only VIF over 5 is the swell pair (rho 0.97) -> the automatic pruning drops
+#    swell_avg_m. Every remaining VIF is <= 3.3, incl. log_lg_hrs at ~1.7.
+# 4. Confounding (Fig 4.5): patrols run Sep-Apr and campaigns Nov-Feb only, so crude
+#    effects include the season. Always adjust for month / season; within season the
+#    patrolled and campaign gaps shrink but remain (t14, t15).
+# 5. Identification (Fig 4.6): pa_system and flags change at only 6 beaches each, and
+#    the static beach features never change -> their effects come from comparing beaches
+#    and may absorb unmeasured beach risk. Treat as weaker evidence than the lifeguard /
+#    drone / campaign effects, which vary within beaches.
+# 6. Beach and time effects (Fig 4.7): strong unexplained beach heterogeneity for Total
+#    (X^2/df ~22) but none for Severe (~1.0) -> beach random effects or credibility
+#    weighting for 'where'. A year effect remains for Total but not Severe; the
+#    FY2020-21 dip is explained by the drivers.
+# 7. Severe has ~6.5 deaths per parameter (reduced set + month) -> keep the severe model lean.
